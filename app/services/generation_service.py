@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from app.models.project import GenerationJob, GenerationJobStatus, Specification
+from app.services.integration_service import IntegrationService
 from app.services.project_service import ProjectService
 from app.tasks.generation_tasks import generate_store
 
@@ -39,6 +40,9 @@ class GenerationService:
                 status_code=status.HTTP_400_BAD_REQUEST, 
                 detail="Specification must be confirmed before generation"
             )
+
+        # Supabase-first flow: generation is allowed only after connection is verified.
+        await IntegrationService.ensure_supabase_connected(db, project_id, user_id)
 
         # check if active job exists
         active_job_result = await db.execute(select(GenerationJob).where(

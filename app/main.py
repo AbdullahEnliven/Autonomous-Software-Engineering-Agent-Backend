@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from app.config import settings
-from app.routers import auth, users, projects, requirements, specifications, generation
+from app.routers import auth, users, projects, requirements, specifications, generation, integrations
 from app.socketio.server import socket_app
 
 @asynccontextmanager
@@ -49,6 +49,11 @@ app.include_router(
     generation.router, 
     prefix="/api/v1/projects/{project_id}/generation", 
     tags=["Generation"]
+)
+app.include_router(
+    integrations.router,
+    prefix="/api/v1/projects/{project_id}/integrations",
+    tags=["Integrations"],
 )
 
 # Mount Socket.IO app

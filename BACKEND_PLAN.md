@@ -11,6 +11,16 @@ The backend does NOT generate code using Docker, complex runtimes, or sandboxes.
 
 The generated store's **runtime backend is entirely on Supabase** — the ASEA backend is only responsible for the generation process, not for hosting the stores themselves.
 
+### Supabase-First Policy (Required)
+
+Before a generation job can start, the user must connect and verify their own Supabase project credentials. This is a hard prerequisite (Lovable-style BYO Supabase flow):
+
+1. User creates/opens a project
+2. User connects Supabase (`/integrations/supabase/test`)
+3. Backend stores connection with `status=connected`
+4. User starts generation
+5. Generation service rejects start if Supabase is not connected
+
 ---
 
 ## Technology Stack
@@ -386,6 +396,8 @@ asea-backend/
 | GET | `/logs` | Get full generation log |
 | POST | `/cancel` | Cancel a running generation job |
 | POST | `/retry` | Retry a failed generation |
+
+`/start` must return `400` if Supabase integration for that project is not connected.
 
 ### Files — `/api/v1/projects/:id/files`
 
@@ -957,23 +969,24 @@ CORS_ORIGINS=["https://asea.app", "http://localhost:5173"]
 2. Database models and initial migration
 3. Authentication system (register, login, JWT, refresh tokens)
 4. User and project CRUD routes
-5. Requirement submission and storage
-6. Gemini API integration (Specification Agent)
-7. Specification review and confirmation routes
-8. Template repository structure and base template
-9. Module Agent + Config Agent
-10. File Writer and project file storage
-11. Validator Agent
-12. Agent Orchestrator
-13. Celery task integration
-14. Socket.IO server and real-time progress events
-15. Preview service (HTML snapshot generation)
-16. Inline file edit endpoint
-17. Artifact packaging (ZIP generation and download)
-18. Supabase integration service (connect, migrate, seed)
-19. GitHub OAuth and push service
-20. Notification system
-21. Rate limiting, caching, security hardening
-22. Monitoring (Sentry, structured logging)
-23. Testing (Pytest unit + integration tests)
-24. CI/CD pipeline and production deployment
+5. Supabase integration service (connect, status, validate credentials)
+6. Requirement submission and storage
+7. Gemini API integration (Specification Agent)
+8. Specification review and confirmation routes
+9. Template repository structure and base template
+10. Module Agent + Config Agent
+11. File Writer and project file storage
+12. Validator Agent
+13. Agent Orchestrator
+14. Celery task integration
+15. Socket.IO server and real-time progress events
+16. Preview service (HTML snapshot generation)
+17. Inline file edit endpoint
+18. Artifact packaging (ZIP generation and download)
+19. Supabase migration + seed execution pipeline
+20. GitHub OAuth and push service
+21. Notification system
+22. Rate limiting, caching, security hardening
+23. Monitoring (Sentry, structured logging)
+24. Testing (Pytest unit + integration tests)
+25. CI/CD pipeline and production deployment

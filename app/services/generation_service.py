@@ -7,6 +7,7 @@ from app.models.project import GenerationJob, GenerationJobStatus, Specification
 from app.services.integration_service import IntegrationService
 from app.services.project_service import ProjectService
 from app.tasks.generation_tasks import generate_store
+from app.tasks.generation_tasks import async_generate_store
 
 class GenerationService:
     @staticmethod
@@ -76,11 +77,17 @@ class GenerationService:
         await db.commit()
         await db.refresh(db_job)
 
-        # 3. Queue Celery Task
-        task = generate_store.delay(str(project_id), str(db_job.id), str(specification_id))
-        
-        db_job.celery_task_id = task.id
-        await db.commit()
+        use_celery = os.getenv("ASEA_USE_CELERY", "false").lower() == "true"
+
+        if use_celery:
+            # 3a. Queue Celery Task (production path)
+            task = generate_store.delay(str(project_id), str(db_job.id), str(specification_id))
+            db_job.celery_task_id = task.id
+            await db.commit()
+            await db.refresh(db_job)
+            return db_job
+
+        # 3b. Inline generation for local/dev environments to ensure preview boots
+        await async_generate_store(str(project_id), str(db_job.id), str(specification_id))
         await db.refresh(db_job)
-        
         return db_job

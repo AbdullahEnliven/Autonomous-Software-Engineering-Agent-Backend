@@ -63,3 +63,17 @@ async def run_supabase_seed(
     current_user: User = Depends(get_current_user),
 ):
     return await IntegrationService.run_supabase_seed(db, project_id, current_user.id)
+
+@router.post(
+    "/deploy",
+    status_code=status.HTTP_200_OK,
+)
+async def deploy_project(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Mock endpoint to handle project deployment."""
+    # In a real implementation this would trigger a Vercel/Netlify API
+    # or push to GitHub.
+    return {"status": "success", "message": "Project deployed successfully (Mock)", "url": f"https://{project_id}.asea.dev"}

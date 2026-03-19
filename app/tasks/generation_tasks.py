@@ -76,7 +76,7 @@ async def async_generate_store(project_id: str, job_id: str, specification_id: s
 
             print(f"Starting Vite dev server on port {port}...")
             # We use npx.cmd on windows
-            subprocess.Popen(['npx.cmd', 'vite', '--port', str(port)], cwd=target_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(f'npx.cmd vite --port {port}', cwd=target_dir, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             await asyncio.sleep(4) # Wait for Vite to boot
 

@@ -133,8 +133,15 @@ async def get_project_files(project_id: str, current_user: User = Depends(get_cu
     """Return mock file tree."""
     return {"files": [{"id": "1", "name": "index.html", "type": "file", "path": "/index.html"}]}
 
+import hashlib
+
 @router.get("/{project_id}/preview/{page}")
 async def get_project_preview(project_id: str, page: str, current_user: User = Depends(get_current_user)):
-    """Return mock preview HTML."""
-    return f"<html><body><h1>Preview of {page} for project {project_id}</h1></body></html>"
+    """Return specific preview HTML based on stable generated port."""
+    # Deterministic port based on Project ID
+    base_hash = int(hashlib.md5(str(project_id).encode()).hexdigest(), 16)
+    port = 6000 + (base_hash % 3000)
+    
+    return f"""<style>body {{ margin: 0; padding: 0; overflow: hidden; }} iframe {{ width: 100vw; height: 100vh; border: none; }}</style><iframe src="http://localhost:{port}/{"" if page == "home" else page.lower()}"></iframe>"""
+
 

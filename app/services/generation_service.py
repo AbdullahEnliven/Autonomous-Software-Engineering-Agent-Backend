@@ -1,3 +1,4 @@
+import os
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -42,7 +43,15 @@ class GenerationService:
             )
 
         # Supabase-first flow: generation is allowed only after connection is verified.
-        await IntegrationService.ensure_supabase_connected(db, project_id, user_id)
+        # We allow an opt-out for offline generation so preview can still boot.
+        require_supabase = os.getenv("ASEA_REQUIRE_SUPABASE", "false").lower() == "true"
+        try:
+            await IntegrationService.ensure_supabase_connected(db, project_id, user_id)
+        except HTTPException as exc:
+            if require_supabase:
+                raise
+            # Log-only fallback so we still generate a local preview without Supabase
+            print(f"[GenerationService] Supabase not connected; proceeding offline. Detail: {exc.detail}")
 
         # check if active job exists
         active_job_result = await db.execute(select(GenerationJob).where(

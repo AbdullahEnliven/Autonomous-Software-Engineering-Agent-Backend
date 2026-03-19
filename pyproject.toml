@@ -17,7 +17,6 @@ dependencies = [
     "celery>=5.3.6",
     "redis>=5.0.3",
     "python-jose[cryptography]>=3.3.0",
-    "passlib[bcrypt]>=1.7.4",
     "python-multipart>=0.0.9",
     "python-socketio>=5.11.2",
     "structlog>=24.1.0",
@@ -28,6 +27,7 @@ dependencies = [
     "supabase>=2.4.1",
     "sqlparse>=0.4.4",
     "groq>=0.13.1",
+    "bcrypt>=5.0.0",
 ]
 
 [tool.pytest.ini_options]

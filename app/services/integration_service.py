@@ -25,10 +25,13 @@ class IntegrationService:
     @staticmethod
     async def _verify_supabase_credentials(credentials: SupabaseCredentials) -> None:
         base_url = credentials.url.rstrip("/")
+        # Hit the health check endpoint or just request an empty query on the projects metadata
+        # We can just request from /rest/v1/?apikey=...
         endpoint = f"{base_url}/rest/v1/"
         headers = {
-            "apikey": credentials.serviceRoleKey,
-            "Authorization": f"Bearer {credentials.serviceRoleKey}",
+            "apikey": credentials.anonKey,
+            "Authorization": f"Bearer {credentials.anonKey}",
+            "Accept-Profile": "public"
         }
 
         try:
@@ -41,16 +44,16 @@ class IntegrationService:
             ) from exc
 
         if response.status_code >= 400:
+            print(f"Supabase returned status {response.status_code}: {response.text}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid Supabase credentials or project URL",
+                detail=f"Invalid Supabase credentials or project URL. Status: {response.status_code}, Body: {response.text}",
             )
 
     @staticmethod
     async def get_supabase_status(db: AsyncSession, project_id: str, user_id: str) -> dict:
         await ProjectService.get_project(db, project_id, user_id)
         integration = await IntegrationService._get_supabase_integration(db, project_id)
-
         if not integration:
             return {
                 "connected": False,
@@ -117,7 +120,6 @@ class IntegrationService:
         db: AsyncSession, project_id: str, user_id: str, credentials: SupabaseCredentials
     ) -> dict:
         await IntegrationService.test_supabase_connection(db, project_id, user_id, credentials)
-
         return {
             "project_id": project_id,
             "status": "ok",
@@ -137,7 +139,6 @@ class IntegrationService:
     async def ensure_supabase_connected(db: AsyncSession, project_id: str, user_id: str) -> None:
         await ProjectService.get_project(db, project_id, user_id)
         integration = await IntegrationService._get_supabase_integration(db, project_id)
-
         if not integration or integration.status != IntegrationStatus.connected:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

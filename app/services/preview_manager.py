@@ -23,7 +23,14 @@ class PreviewManager:
             return
             
         port = PreviewManager.get_port(project_id)
-        target_dir = os.path.join(settings.USER_PROJECTS_DIR, project_id)
+        
+        # Compute user_projects dir dynamically (same as generation_tasks.py)
+        if settings.USER_PROJECTS_DIR:
+            target_dir = os.path.join(settings.USER_PROJECTS_DIR, project_id)
+        else:
+            backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            root_dir = os.path.dirname(backend_dir)
+            target_dir = os.path.join(root_dir, 'user_projects', project_id)
         
         if not os.path.exists(target_dir):
             return # Project doesn't exist yet

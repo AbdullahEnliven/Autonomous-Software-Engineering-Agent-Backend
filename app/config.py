@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     # Storage
     STORAGE_PATH: str = "/tmp/asea/projects"
     ARTIFACT_PATH: str = "/tmp/asea/artifacts"
+    USER_PROJECTS_DIR: str = ""
     
     # Monitoring
     SENTRY_DSN: str = ""

@@ -33,7 +33,7 @@ async def disconnect(sid):
 async def join_project(sid, data):
     project_id = data.get("project_id")
     if project_id:
-        sio.enter_room(sid, project_id)
+        await sio.enter_room(sid, project_id)
         client_projects[sid] = project_id
         print(f"Client {sid} joined room: {project_id}")
         await sio.emit("notification", {"type": "info", "message": f"Joined project {project_id}"}, to=sid)
@@ -66,21 +66,27 @@ async def handle_chat_message(sid, data):
     # Notify room the agent is thinking
     await sio.emit("agent_typing", {"project_id": project_id}, to=sid)
     
-    # Run the agent
+    # Run the agent with Socket.IO access for real-time status events
     agent = EditorAgent()
+    agent.sio = sio
+    agent.sid = sid
     result = await agent.execute_edit(project_id, message)
     
     if "error" in result:
         await sio.emit("agent_reply", {
             "project_id": project_id,
-            "message": f"Sorry, I encountered an error: {result['error']}"
+            "message": f"Sorry, I encountered an error: {result['error']}",
+            "files_modified": [],
+            "plan": ""
         }, to=sid)
     else:
         await sio.emit("agent_reply", {
             "project_id": project_id,
-            "message": result.get("reply", "I've updated the code for you.")
+            "message": result.get("reply", "I've updated the code for you."),
+            "files_modified": result.get("files_modified", []),
+            "plan": result.get("plan", "")
         }, to=sid)
         
-        # Notify clients to trigger preview reload Native HMR handles reload mostly, but we can emit a refresh event
+        # Notify clients to trigger preview reload — HMR handles most, but emit refresh event
         await sio.emit("code_updated", {"project_id": project_id}, room=project_id)
 

@@ -39,6 +39,7 @@ def create_project_from_template(base_dir: str, template_name: str, target_dir: 
     _update_layout_components(target_dir, normalized_config)
     _update_homepage_content(target_dir, normalized_config)
     _update_home_splash(target_dir, normalized_config)
+    _write_env_file(target_dir, normalized_config)
 
 def _update_package_json(target_dir: str, config: dict):
     path = os.path.join(target_dir, 'package.json')
@@ -156,4 +157,30 @@ def _update_home_splash(target_dir: str, config: dict):
 
     with open(path, 'w', encoding='utf-8') as f:
         f.write(content)
+
+
+def _write_env_file(target_dir: str, config: dict):
+    """Generate .env from .env.example with VITE_APP_NAME set to the store name."""
+    example_path = os.path.join(target_dir, '.env.example')
+    env_path = os.path.join(target_dir, '.env')
+
+    store_name = config.get('store_name', 'ASEA Store')
+
+    if os.path.exists(example_path):
+        with open(example_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Replace the VITE_APP_NAME value with the actual store name
+        content = re.sub(
+            r'VITE_APP_NAME=.*',
+            f'VITE_APP_NAME={store_name}',
+            content
+        )
+
+        with open(env_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+    else:
+        # No .env.example found — write a minimal .env
+        with open(env_path, 'w', encoding='utf-8') as f:
+            f.write(f'VITE_APP_NAME={store_name}\n')
 

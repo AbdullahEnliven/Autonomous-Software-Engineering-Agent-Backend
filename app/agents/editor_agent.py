@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import google.generativeai as genai
 from groq import Groq
 
@@ -11,10 +11,16 @@ from app.agents.base_agent import BaseAgent
 genai.configure(api_key=settings.GEMINI_API_KEY)
 
 class EditorAgent(BaseAgent):
-    """Agent responsible for editing project files based on chat instructions."""
+    """Powerful AI code editor agent with multi-step reasoning and real-time status updates."""
+    
+    # File extensions to include when scanning
+    SCAN_EXTENSIONS = ('.jsx', '.js', '.tsx', '.ts', '.css', '.json')
+    # Directories to skip
+    SKIP_DIRS = {'node_modules', '.git', 'dist', 'build', '.next', '__pycache__'}
+    # Maximum files to include in context (ranked by relevance)
+    MAX_CONTEXT_FILES = 8
     
     def __init__(self):
-        # We use a model that handles JSON reliably.
         self.gemini_model = genai.GenerativeModel("gemini-1.5-flash")
         
         # Groq Fallback Client
@@ -22,49 +28,83 @@ class EditorAgent(BaseAgent):
         if settings.GROQ_API_KEY:
             self.groq_client = Groq(api_key=settings.GROQ_API_KEY)
             self.groq_model = settings.GROQ_LLM_MODEL
-            
-    def _get_project_context(self, target_dir: str, prompt: str) -> str:
-        """Read relevant files to provide context to the LLM, filtered by prompt."""
-        context = ""
-        directories_to_scan = [
-            os.path.join(target_dir, "src", "pages"),
-            os.path.join(target_dir, "src", "components"),
-            os.path.join(target_dir, "src", "utils")
-        ]
         
-        prompt_lower = prompt.lower()
-        files_collected = []
-        
-        for directory in directories_to_scan:
-            if not os.path.exists(directory):
-                continue
-            for root, _, files in os.walk(directory):
-                for file in files:
-                    if file.endswith((".jsx", ".js", ".css")):
-                        file_path = os.path.join(root, file)
-                        files_collected.append(file_path)
+        # Socket.IO references for real-time status
+        self.sio = None
+        self.sid = None
 
-        # Basic filtering to prevent hitting rate limits
+    async def _emit_status(self, status_type: str, message: str, details: Optional[Dict] = None):
+        """Emit real-time status update to the connected client via Socket.IO."""
+        if self.sio and self.sid:
+            await self.sio.emit("agent_status", {
+                "type": status_type,
+                "message": message,
+                "details": details or {}
+            }, to=self.sid)
+        self.log(f"[{status_type.upper()}] {message}")
+
+    def _scan_project_files(self, target_dir: str) -> List[str]:
+        """Scan the entire src/ directory tree for editable files."""
+        files_collected = []
+        src_dir = os.path.join(target_dir, "src")
+        
+        if not os.path.exists(src_dir):
+            # Fallback: scan target_dir itself
+            src_dir = target_dir
+        
+        for root, dirs, files in os.walk(src_dir):
+            # Skip ignored directories
+            dirs[:] = [d for d in dirs if d not in self.SKIP_DIRS]
+            for file in files:
+                if file.endswith(self.SCAN_EXTENSIONS):
+                    files_collected.append(os.path.join(root, file))
+        
+        return files_collected
+
+    def _rank_files(self, files: List[str], prompt: str, target_dir: str) -> List[str]:
+        """Rank files by relevance to the user's prompt."""
+        prompt_lower = prompt.lower()
+        prompt_words = set(prompt_lower.split())
+        
         scored_files = []
-        for fp in files_collected:
+        for fp in files:
             score = 0
+            rel_path = os.path.relpath(fp, target_dir).lower()
             name_lower = os.path.basename(fp).lower()
-            name_no_ext = name_lower.replace('.jsx', '').replace('.js', '')
+            name_no_ext = os.path.splitext(name_lower)[0]
             
+            # Direct file name mention in prompt
             if name_no_ext in prompt_lower:
-                score += 10 # Explicit mention
-            elif 'home' in name_lower or 'header' in name_lower or 'app' in name_lower:
-                score += 1 # High-priority fallback pages
-                
-            scored_files.append((score, fp))
+                score += 20
             
+            # Partial word matches in the relative path
+            for word in prompt_words:
+                if len(word) > 2 and word in rel_path:
+                    score += 5
+            
+            # High-priority files (layout, main, app, index, home, header)
+            priority_names = {'app', 'main', 'index', 'home', 'header', 'footer', 'layout', 'navbar', 'sidebar'}
+            if name_no_ext in priority_names:
+                score += 3
+            
+            # Pages and components get a slight boost
+            if 'pages' in rel_path or 'components' in rel_path:
+                score += 2
+            
+            # Config files
+            if name_no_ext in {'tailwind.config', 'vite.config', 'package'}:
+                score += 1
+            
+            scored_files.append((score, fp))
+        
         # Sort by score descending
         scored_files.sort(key=lambda x: x[0], reverse=True)
-        
-        # Take top 3 files to strictly limit token size under free tier limits
-        top_files = [fp for score, fp in scored_files[:3]]
-        
-        for file_path in top_files:
+        return [fp for _, fp in scored_files[:self.MAX_CONTEXT_FILES]]
+
+    def _read_files_context(self, file_paths: List[str], target_dir: str) -> str:
+        """Read file contents and format as context string."""
+        context = ""
+        for file_path in file_paths:
             rel_path = os.path.relpath(file_path, target_dir)
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
@@ -72,10 +112,30 @@ class EditorAgent(BaseAgent):
                 context += f"\n--- {rel_path} ---\n{content}\n"
             except Exception as e:
                 self.log(f"Failed to read {file_path}: {e}")
-                
         return context
 
+    def _build_file_tree(self, target_dir: str) -> str:
+        """Build a compact file tree string for the LLM to understand project structure."""
+        tree_lines = []
+        src_dir = os.path.join(target_dir, "src")
+        if not os.path.exists(src_dir):
+            src_dir = target_dir
+        
+        for root, dirs, files in os.walk(src_dir):
+            dirs[:] = [d for d in dirs if d not in self.SKIP_DIRS]
+            level = os.path.relpath(root, target_dir).count(os.sep)
+            indent = "  " * level
+            dir_name = os.path.basename(root)
+            tree_lines.append(f"{indent}{dir_name}/")
+            sub_indent = "  " * (level + 1)
+            for file in sorted(files):
+                if file.endswith(self.SCAN_EXTENSIONS):
+                    tree_lines.append(f"{sub_indent}{file}")
+        
+        return "\n".join(tree_lines[:60])  # Cap to prevent token overflow
+
     async def execute_edit(self, project_id: str, user_message: str) -> Dict[str, Any]:
+        """Execute a multi-step edit with real-time status updates."""
         self.log(f"Executing edit for project {project_id} with msg: {user_message}")
         
         backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -84,29 +144,61 @@ class EditorAgent(BaseAgent):
         
         if not os.path.exists(target_dir):
             return {"error": "Project directory not found. Please wait for generation."}
-            
-        context = self._get_project_context(target_dir, user_message)
+        
+        # Step 1: Scan project files
+        await self._emit_status("scanning", "Scanning project files...", {"step": 1, "total_steps": 4})
+        all_files = self._scan_project_files(target_dir)
+        file_tree = self._build_file_tree(target_dir)
+        
+        await self._emit_status("scanning", f"Found {len(all_files)} editable files", {
+            "step": 1, "total_steps": 4, "file_count": len(all_files)
+        })
+        
+        # Step 2: Rank and read relevant files
+        await self._emit_status("analyzing", "Analyzing relevant files...", {"step": 2, "total_steps": 4})
+        ranked_files = self._rank_files(all_files, user_message, target_dir)
+        context = self._read_files_context(ranked_files, target_dir)
+        
+        files_read = [os.path.relpath(f, target_dir) for f in ranked_files]
+        await self._emit_status("analyzing", f"Read {len(ranked_files)} relevant files", {
+            "step": 2, "total_steps": 4, "files_read": files_read
+        })
+        
+        # Step 3: Plan and generate changes via LLM
+        await self._emit_status("planning", "Planning changes with AI...", {"step": 3, "total_steps": 4})
         
         prompt = f"""
-        You are an expert AI software engineer for an e-commerce platform called ASEA.
-        The user wants to make a change to their generated React frontend code.
+        You are an expert AI software engineer working on a React/Vite e-commerce project.
+        The user wants to make a change to their generated frontend code.
         
         USER REQUEST: {user_message}
         
-        CURRENT PROJECT CONTEXT:
+        PROJECT FILE TREE:
+        {file_tree}
+        
+        RELEVANT FILE CONTENTS:
         {context}
         
-        Based on the user's request, figure out which file(s) need to be modified.
-        Return the exact FULL CODE of the updated file(s) so we can overwrite them.
-        Do not explain. Return ONLY valid JSON in this format:
+        INSTRUCTIONS:
+        1. Analyze the current codebase and understand the existing patterns and styles.
+        2. Plan the minimal set of changes needed to fulfill the user's request.
+        3. You can MODIFY existing files or CREATE new ones.
+        4. Return the COMPLETE updated content for each file (not just diffs).
+        5. Maintain existing code style, imports, and patterns.
+        6. Ensure all React components remain valid JSX.
+        
+        Return ONLY valid JSON in this exact format:
         {{
-            "agent_reply": "A friendly message to the user summarizing what you did.",
+            "plan": "A brief description of what you decided to do and why.",
+            "agent_reply": "A friendly, concise message to the user summarizing the changes made.",
             "changes": [
                 {{
-                    "file_path": "src/pages/Home.jsx", 
-                    "content": "..." 
+                    "file_path": "src/pages/Home.jsx",
+                    "action": "modify",
+                    "content": "...full file content..."
                 }}
-            ]
+            ],
+            "files_modified": ["src/pages/Home.jsx"]
         }}
         """
         
@@ -122,15 +214,11 @@ class EditorAgent(BaseAgent):
             self.log("Received response from Gemini EditorAgent")
             parsed_response = json.loads(raw_json)
             
-            # Apply changes
-            await self._apply_changes(target_dir, parsed_response.get("changes", []))
-            
-            return {"reply": parsed_response.get("agent_reply", "I've applied the changes.")}
-            
         except Exception as e:
             self.log(f"Gemini editing failed: {str(e)}")
             if self.groq_client:
                 self.log(f"Falling back to Groq model {self.groq_model}")
+                await self._emit_status("planning", "Switching to fallback AI model...", {"step": 3, "total_steps": 4})
                 try:
                     chat_completion = self.groq_client.chat.completions.create(
                         messages=[
@@ -142,18 +230,37 @@ class EditorAgent(BaseAgent):
                     raw_json = chat_completion.choices[0].message.content
                     self.log("Received response from Groq EditorAgent")
                     parsed_response = json.loads(raw_json)
-                    
-                    # Apply changes
-                    await self._apply_changes(target_dir, parsed_response.get("changes", []))
-                    
-                    return {"reply": parsed_response.get("agent_reply", "I've applied the changes using Groq fallback.")}
                 except Exception as groq_e:
                     self.log(f"Groq fallback failed: {str(groq_e)}")
-                    return {"error": f"Editing failed on both Gemini and Groq. groq error: {str(groq_e)}"}
+                    await self._emit_status("error", "Failed to generate changes", {"step": 3, "total_steps": 4})
+                    return {"error": f"Editing failed on both Gemini and Groq. Error: {str(groq_e)}"}
             else:
+                await self._emit_status("error", "Failed to generate changes", {"step": 3, "total_steps": 4})
                 return {"error": f"Editing failed: {str(e)}"}
+        
+        # Step 4: Apply changes
+        changes = parsed_response.get("changes", [])
+        files_modified = parsed_response.get("files_modified", [])
+        
+        await self._emit_status("writing", f"Applying {len(changes)} file change(s)...", {
+            "step": 4, "total_steps": 4, "files": files_modified
+        })
+        
+        await self._apply_changes(target_dir, changes)
+        
+        # Done
+        await self._emit_status("complete", "All changes applied successfully!", {
+            "step": 4, "total_steps": 4, "files_modified": files_modified
+        })
+        
+        return {
+            "reply": parsed_response.get("agent_reply", "I've applied the changes."),
+            "plan": parsed_response.get("plan", ""),
+            "files_modified": files_modified
+        }
             
     async def _apply_changes(self, target_dir: str, changes: List[Dict[str, Any]]):
+        """Write file changes to disk."""
         for change in changes:
             rel_path = change.get("file_path")
             content = change.get("content")
@@ -161,7 +268,7 @@ class EditorAgent(BaseAgent):
                 continue
                 
             file_path = os.path.join(target_dir, str(rel_path))
-            # Ensure it is securely within target_dir
+            # Security: ensure path stays within target_dir
             if not os.path.abspath(file_path).startswith(os.path.abspath(target_dir)):
                 self.log(f"Warning: path traversal attempt prevented: {rel_path}")
                 continue
@@ -169,4 +276,4 @@ class EditorAgent(BaseAgent):
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(str(content))
-            self.log(f"Rewrote file: {rel_path}")
+            self.log(f"Wrote file: {rel_path}")

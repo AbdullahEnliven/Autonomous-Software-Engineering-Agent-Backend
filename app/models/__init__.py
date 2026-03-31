@@ -7,7 +7,9 @@ from app.models.project import (
     GenerationJob, 
     ProjectFile, 
     Artifact, 
-    Integration
+    Integration,
+    ChatMessage,
+    ProjectCheckpoint,
 )
 
 __all__ = [
@@ -22,4 +24,6 @@ __all__ = [
     "ProjectFile",
     "Artifact",
     "Integration",
+    "ChatMessage",
+    "ProjectCheckpoint",
 ]

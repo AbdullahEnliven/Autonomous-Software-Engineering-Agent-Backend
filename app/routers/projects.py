@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, status, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List
 
@@ -12,6 +12,8 @@ from app.services.project_service import ProjectService
 from app.services.requirement_service import RequirementService
 from app.services.specification_service import SpecificationService
 from app.services.generation_service import GenerationService
+from app.services.chat_service import ChatService
+from app.services.version_control_service import VersionControlService
 from pydantic import BaseModel
 from sqlalchemy.future import select
 
@@ -19,6 +21,10 @@ router = APIRouter()
 
 class EnhanceRequest(BaseModel):
     text: str
+
+
+class CheckpointCreateRequest(BaseModel):
+    message: str = ""
 
 @router.get("/", response_model=List[ProjectResponse])
 async def list_projects(
@@ -53,6 +59,20 @@ async def create_project(
         preferences={"targetMarket": project_in.targetMarket} if project_in.targetMarket else {}
     )
     req = await RequirementService.create_requirement(db, req_in, str(project.id), current_user.id)
+
+    # Seed chat history so the first chat message is the original store description.
+    if project_in.requirements and project_in.requirements.strip():
+        try:
+            await ChatService.create_message(
+                db,
+                str(project.id),
+                "user",
+                project_in.requirements.strip(),
+                {"source": "project_creation"},
+            )
+        except Exception:
+            # If migrations are not applied yet, do not block project creation.
+            pass
     
     # 3. Generate spec
     spec = await SpecificationService.generate_specification(db, str(req.id), str(project.id), current_user.id)
@@ -60,6 +80,88 @@ async def create_project(
     return {
         "project": project,
         "spec": spec
+    }
+
+
+@router.get("/{project_id}/chat-history")
+async def get_project_chat_history(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await ProjectService.get_project(db, project_id, current_user.id)
+    messages = await ChatService.get_messages(db, project_id)
+    return {
+        "messages": [
+            {
+                "id": str(message.id),
+                "role": message.role,
+                "content": message.content,
+                "metadata": message.message_metadata or {},
+                "created_at": message.created_at,
+            }
+            for message in messages
+        ]
+    }
+
+
+@router.get("/{project_id}/checkpoints")
+async def list_project_checkpoints(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await ProjectService.get_project(db, project_id, current_user.id)
+    checkpoints = await VersionControlService.list_checkpoints(db, project_id)
+    return {
+        "checkpoints": [
+            {
+                "id": str(checkpoint.id),
+                "message": checkpoint.message,
+                "commit_hash": checkpoint.commit_hash,
+                "created_at": checkpoint.created_at,
+            }
+            for checkpoint in checkpoints
+        ]
+    }
+
+
+@router.post("/{project_id}/checkpoints", status_code=status.HTTP_201_CREATED)
+async def create_project_checkpoint(
+    project_id: str,
+    payload: CheckpointCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await ProjectService.get_project(db, project_id, current_user.id)
+    checkpoint = await VersionControlService.create_checkpoint(db, project_id, payload.message)
+    return {
+        "checkpoint": {
+            "id": str(checkpoint.id),
+            "message": checkpoint.message,
+            "commit_hash": checkpoint.commit_hash,
+            "created_at": checkpoint.created_at,
+        }
+    }
+
+
+@router.post("/{project_id}/checkpoints/{checkpoint_id}/restore")
+async def restore_project_checkpoint(
+    project_id: str,
+    checkpoint_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await ProjectService.get_project(db, project_id, current_user.id)
+    checkpoint = await VersionControlService.restore_checkpoint(db, project_id, checkpoint_id)
+    return {
+        "status": "ok",
+        "restored_checkpoint": {
+            "id": str(checkpoint.id),
+            "message": checkpoint.message,
+            "commit_hash": checkpoint.commit_hash,
+            "created_at": checkpoint.created_at,
+        },
     }
 
 @router.get("/{project_id}", response_model=ProjectResponse)

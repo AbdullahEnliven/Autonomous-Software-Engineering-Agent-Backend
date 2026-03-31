@@ -50,6 +50,8 @@ class Project(Base):
     artifacts = relationship("Artifact", back_populates="project", cascade="all, delete-orphan")
     integrations = relationship("Integration", back_populates="project", cascade="all, delete-orphan")
     notifications = relationship("Notification", back_populates="project")
+    chat_messages = relationship("ChatMessage", back_populates="project", cascade="all, delete-orphan")
+    checkpoints = relationship("ProjectCheckpoint", back_populates="project", cascade="all, delete-orphan")
 
 
 class Requirement(Base):
@@ -147,3 +149,28 @@ class Integration(Base):
     connected_at = Column(DateTime(timezone=True), default=utc_now)
 
     project = relationship("Project", back_populates="integrations")
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id"), nullable=False)
+    role = Column(String, nullable=False)  # user | agent
+    content = Column(TEXT, nullable=False)
+    message_metadata = Column("metadata", JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+
+    project = relationship("Project", back_populates="chat_messages")
+
+
+class ProjectCheckpoint(Base):
+    __tablename__ = "project_checkpoints"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id"), nullable=False)
+    commit_hash = Column(String, nullable=False)
+    message = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+
+    project = relationship("Project", back_populates="checkpoints")

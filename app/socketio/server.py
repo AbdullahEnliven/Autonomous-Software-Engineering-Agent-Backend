@@ -1,6 +1,9 @@
 import socketio
 from app.config import settings
+from app.database import async_session_maker
 from app.services.preview_manager import PreviewManager
+from app.services.chat_service import ChatService
+from app.services.version_control_service import VersionControlService
 from app.agents.editor_agent import EditorAgent
 
 sio = socketio.AsyncServer(
@@ -62,6 +65,21 @@ async def handle_chat_message(sid, data):
         return
         
     print(f"Received chat from {sid} for project {project_id}: {message}")
+
+    # Each chat message becomes a git checkpoint (best effort).
+    checkpoint_message = f"Chat checkpoint: {message.strip()[:120]}"
+    try:
+        async with async_session_maker() as db:
+            await VersionControlService.create_checkpoint(db, project_id, checkpoint_message)
+    except Exception as exc:
+        print(f"Failed to create chat checkpoint: {exc}")
+
+    # Save user message to persistent chat history.
+    try:
+        async with async_session_maker() as db:
+            await ChatService.create_message(db, project_id, "user", message)
+    except Exception as exc:
+        print(f"Failed to persist user chat message: {exc}")
     
     # Notify room the agent is thinking
     await sio.emit("agent_typing", {"project_id": project_id}, to=sid)
@@ -73,16 +91,39 @@ async def handle_chat_message(sid, data):
     result = await agent.execute_edit(project_id, message)
     
     if "error" in result:
+        error_message = f"Sorry, I encountered an error: {result['error']}"
+        try:
+            async with async_session_maker() as db:
+                await ChatService.create_message(db, project_id, "agent", error_message, {"error": True})
+        except Exception as exc:
+            print(f"Failed to persist agent error message: {exc}")
+
         await sio.emit("agent_reply", {
             "project_id": project_id,
-            "message": f"Sorry, I encountered an error: {result['error']}",
+            "message": error_message,
             "files_modified": [],
             "plan": ""
         }, to=sid)
     else:
+        agent_reply = result.get("reply", "I've updated the code for you.")
+        try:
+            async with async_session_maker() as db:
+                await ChatService.create_message(
+                    db,
+                    project_id,
+                    "agent",
+                    agent_reply,
+                    {
+                        "files_modified": result.get("files_modified", []),
+                        "plan": result.get("plan", ""),
+                    },
+                )
+        except Exception as exc:
+            print(f"Failed to persist agent reply: {exc}")
+
         await sio.emit("agent_reply", {
             "project_id": project_id,
-            "message": result.get("reply", "I've updated the code for you."),
+            "message": agent_reply,
             "files_modified": result.get("files_modified", []),
             "plan": result.get("plan", "")
         }, to=sid)

@@ -1,5 +1,6 @@
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, status, Request, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import BaseModel
 
 from app.database import get_db
 from app.dependencies import get_current_user
@@ -11,6 +12,7 @@ from app.schemas.integration import (
     SupabaseStatusResponse,
 )
 from app.services.integration_service import IntegrationService
+from app.services.deployment_service import DeploymentService
 
 router = APIRouter()
 
@@ -64,16 +66,26 @@ async def run_supabase_seed(
 ):
     return await IntegrationService.run_supabase_seed(db, project_id, current_user.id)
 
+
 @router.post(
     "/deploy",
     status_code=status.HTTP_200_OK,
 )
 async def deploy_project(
     project_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Mock endpoint to handle project deployment."""
-    # In a real implementation this would trigger a Vercel/Netlify API
-    # or push to GitHub.
-    return {"status": "success", "message": "Project deployed successfully (Mock)", "url": f"https://{project_id}.asea.dev"}
+    """Trigger the ASEA Cloud deployment sequence."""
+    try:
+        body = await request.json()
+        pid_str = str(project_id)
+        subdomain = body.get("subdomain", f"store-{pid_str[:5]}")
+        url = await DeploymentService.deploy_project(project_id, subdomain)
+        return {"status": "success", "message": "Deployed successfully", "url": url}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))

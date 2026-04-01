@@ -2,23 +2,52 @@ import os
 import shutil
 import json
 import re
+import subprocess
 
 
 def _escape_js(value: str) -> str:
     return value.replace('"', '\\"') if isinstance(value, str) else value
 
+
+def _get_ignore_patterns():
+    """Return a function to ignore certain directories when copying template."""
+    def ignore_patterns(directory, files):
+        # Exclude .git, node_modules, .env files, and other unnecessary dirs
+        ignored = set()
+        for f in files:
+            if f in {'.git', 'node_modules', '.env', '.env.local', '.env.*.local', '.gitignore'}:
+                ignored.add(f)
+        return ignored
+    return ignore_patterns
+
+
+def _init_git_repo(target_dir: str):
+    """Initialize a fresh Git repository for the project."""
+    try:
+        subprocess.run(['git', 'init'], cwd=target_dir, check=True, capture_output=True)
+        subprocess.run(['git', 'config', 'user.email', 'asea@project.local'], cwd=target_dir, check=True, capture_output=True)
+        subprocess.run(['git', 'config', 'user.name', 'ASEA Project'], cwd=target_dir, check=True, capture_output=True)
+        # Initial commit
+        subprocess.run(['git', 'add', '.'], cwd=target_dir, check=True, capture_output=True)
+        subprocess.run(['git', 'commit', '-m', 'Initial project from template'], cwd=target_dir, check=True, capture_output=True)
+    except Exception as e:
+        # Log but don't fail if git init fails
+        print(f"Warning: Failed to initialize git repo for {target_dir}: {e}")
+
+
 def create_project_from_template(base_dir: str, template_name: str, target_dir: str, config: dict):
     """
     Clones the template directory and injects the project-specific config.
     base_dir should be the root ASEA folder.
+    Each project gets its own isolated Git repository.
     """
     template_path = os.path.join(base_dir, template_name)
 
     if os.path.exists(target_dir):
         shutil.rmtree(target_dir)
 
-    # Copy all files
-    shutil.copytree(template_path, target_dir)
+    # Copy all files EXCEPT .git, node_modules, and .env files
+    shutil.copytree(template_path, target_dir, ignore=_get_ignore_patterns())
 
     # Normalize config with sensible fallbacks derived from the spec
     store_name = config.get('store_name', 'ASEA Store')
@@ -40,7 +69,8 @@ def create_project_from_template(base_dir: str, template_name: str, target_dir: 
     _update_homepage_content(target_dir, normalized_config)
     _update_home_splash(target_dir, normalized_config)
     _write_env_file(target_dir, normalized_config)
-
+    # Initialize fresh Git repository for this project
+    _init_git_repo(target_dir)
 def _update_package_json(target_dir: str, config: dict):
     path = os.path.join(target_dir, 'package.json')
     if not os.path.exists(path): return

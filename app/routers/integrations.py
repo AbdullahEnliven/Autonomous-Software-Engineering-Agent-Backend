@@ -79,7 +79,8 @@ async def deploy_project(
 ):
     """Trigger the ASEA Cloud deployment sequence."""
     try:
-        body = await request.json()
+        body_bytes = await request.body()
+        body = await request.json() if body_bytes else {}
         pid_str = str(project_id)
         subdomain = body.get("subdomain", f"store-{pid_str[:5]}")
         url = await DeploymentService.deploy_project(project_id, subdomain)

@@ -27,6 +27,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+@app.get("/")
+async def root():
+    return {"Welcome to the ASEA Backend API!"}  
 
 @app.get("/health")
 async def health_check():

@@ -19,6 +19,7 @@ from app.services.specification_service import SpecificationService
 from app.services.generation_service import GenerationService
 from app.services.chat_service import ChatService
 from app.services.version_control_service import VersionControlService
+from app.services.name_selector_service import NameSelectorService
 from pydantic import BaseModel
 from sqlalchemy.future import select
 
@@ -68,8 +69,20 @@ async def create_project(
     current_user: User = Depends(get_current_user)
 ):
     """Create a new project, submit requirement, and generate spec in one go."""
-    # 1. Create project
-    project_name = project_in.storeName or "Untitled Store"
+    # 1. Resolve project/store name.
+    provided_name = (project_in.storeName or "").strip()
+    if provided_name:
+        project_name = provided_name
+        name_source = "user"
+    else:
+        project_name = NameSelectorService.select_name_with_groq(
+            requirements=project_in.requirements,
+            category=project_in.category,
+            target_market=project_in.targetMarket,
+        )
+        name_source = "groq"
+
+    # 2. Create project
     project_create_schema = ProjectCreate(
         storeName=project_name, 
         requirements=project_in.requirements,
@@ -79,11 +92,15 @@ async def create_project(
     # Patch for old create
     project = await ProjectService.create_project(db, project_create_schema, current_user.id)
     
-    # 2. Create requirement
+    # 3. Create requirement
     req_in = RequirementCreate(
         raw_text=project_in.requirements,
         category=project_in.category,
-        preferences={"targetMarket": project_in.targetMarket} if project_in.targetMarket else {}
+        preferences={
+            **({"targetMarket": project_in.targetMarket} if project_in.targetMarket else {}),
+            "explicit_store_name": project_name,
+            "store_name_source": name_source,
+        }
     )
     req = await RequirementService.create_requirement(db, req_in, str(project.id), current_user.id)
 
@@ -101,8 +118,14 @@ async def create_project(
             # If migrations are not applied yet, do not block project creation.
             pass
     
-    # 3. Generate spec
-    spec = await SpecificationService.generate_specification(db, str(req.id), str(project.id), current_user.id)
+    # 4. Generate spec
+    spec = await SpecificationService.generate_specification(
+        db,
+        str(req.id),
+        str(project.id),
+        current_user.id,
+        forced_store_name=project_name,
+    )
     
     return {
         "project": project,

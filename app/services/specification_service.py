@@ -23,7 +23,13 @@ class SpecificationService:
         return specification
 
     @staticmethod
-    async def generate_specification(db: AsyncSession, requirement_id: str, project_id: str, user_id: str):
+    async def generate_specification(
+        db: AsyncSession,
+        requirement_id: str,
+        project_id: str,
+        user_id: str,
+        forced_store_name: str | None = None,
+    ):
         await ProjectService.get_project(db, project_id, user_id)
         
         result = await db.execute(select(Requirement).where(
@@ -39,6 +45,9 @@ class SpecificationService:
             spec_dict = await agent.generate_specification(requirement)
         except Exception as e:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to generate spec: {str(e)}")
+
+        if forced_store_name and forced_store_name.strip():
+            spec_dict["store_name"] = forced_store_name.strip()
             
         db_spec = Specification(
             project_id=project_id,

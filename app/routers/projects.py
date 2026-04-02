@@ -1,6 +1,11 @@
 from fastapi import APIRouter, Depends, status, HTTPException
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List
+from pathlib import Path
+import hashlib
+import tempfile
+import zipfile
 
 from app.database import get_db
 from app.models.user import User
@@ -25,6 +30,28 @@ class EnhanceRequest(BaseModel):
 
 class CheckpointCreateRequest(BaseModel):
     message: str = ""
+
+
+class FileUpdateRequest(BaseModel):
+    content: str
+
+
+IGNORED_DIRS = {".git", "node_modules", "dist", "build", "__pycache__", ".pytest_cache"}
+
+
+def _get_project_dir(project_id: str) -> Path:
+    backend_dir = Path(__file__).resolve().parents[2]
+    root_dir = backend_dir.parent
+    return root_dir / "user_projects" / str(project_id)
+
+
+def _safe_project_path(project_id: str, file_path: str) -> Path:
+    project_dir = _get_project_dir(project_id).resolve()
+    rel = (file_path or "").replace("\\", "/").lstrip("/")
+    candidate = (project_dir / rel).resolve()
+    if project_dir not in candidate.parents and candidate != project_dir:
+        raise HTTPException(status_code=400, detail="Invalid file path")
+    return candidate
 
 @router.get("/", response_model=List[ProjectResponse])
 async def list_projects(
@@ -231,11 +258,114 @@ async def enhance_requirements(req: EnhanceRequest, current_user: User = Depends
     return {"enhanced": enhanced}
 
 @router.get("/{project_id}/files")
-async def get_project_files(project_id: str, current_user: User = Depends(get_current_user)):
-    """Return mock file tree."""
-    return {"files": [{"id": "1", "name": "index.html", "type": "file", "path": "/index.html"}]}
+async def get_project_files(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return recursive project files for the code viewer."""
+    await ProjectService.get_project(db, project_id, current_user.id)
 
-import hashlib
+    project_dir = _get_project_dir(project_id)
+    if not project_dir.exists() or not project_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Project files not found")
+
+    files = []
+    for path in project_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(project_dir).as_posix()
+        parts = rel.split("/")
+        if any(part in IGNORED_DIRS for part in parts):
+            continue
+        files.append(
+            {
+                "id": rel,
+                "name": path.name,
+                "type": "file",
+                "path": rel,
+                "size": path.stat().st_size,
+            }
+        )
+
+    files.sort(key=lambda item: item["path"])
+    return {"files": files}
+
+
+@router.get("/{project_id}/files/{file_path:path}")
+async def get_project_file_content(
+    project_id: str,
+    file_path: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await ProjectService.get_project(db, project_id, current_user.id)
+
+    path = _safe_project_path(project_id, file_path)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    try:
+        content = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="Binary files are not supported in editor")
+
+    return {"path": path.relative_to(_get_project_dir(project_id)).as_posix(), "content": content}
+
+
+@router.patch("/{project_id}/files/{file_path:path}")
+async def update_project_file_content(
+    project_id: str,
+    file_path: str,
+    payload: FileUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await ProjectService.get_project(db, project_id, current_user.id)
+
+    path = _safe_project_path(project_id, file_path)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    try:
+        path.write_text(payload.content, encoding="utf-8")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to update file: {exc}")
+
+    return {"status": "ok", "path": path.relative_to(_get_project_dir(project_id)).as_posix()}
+
+
+@router.get("/{project_id}/download")
+async def download_project_zip(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Download project source as a zip (excluding heavy runtime folders)."""
+    await ProjectService.get_project(db, project_id, current_user.id)
+
+    project_dir = _get_project_dir(project_id)
+    if not project_dir.exists() or not project_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Project files not found")
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="asea_zip_"))
+    zip_path = tmp_dir / f"project-{project_id}.zip"
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in project_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(project_dir).as_posix()
+            parts = rel.split("/")
+            if any(part in IGNORED_DIRS for part in parts):
+                continue
+            zf.write(path, arcname=rel)
+
+    return FileResponse(
+        path=str(zip_path),
+        filename=f"project-{project_id}.zip",
+        media_type="application/zip",
+    )
 
 @router.get("/{project_id}/preview/{page}")
 async def get_project_preview(project_id: str, page: str, current_user: User = Depends(get_current_user)):

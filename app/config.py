@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     STORAGE_PATH: str = "/tmp/asea/projects"
     ARTIFACT_PATH: str = "/tmp/asea/artifacts"
     USER_PROJECTS_DIR: str = ""
+    TEMPLATE_DIR: str = ""
     
     # Deployment
     DEPLOYMENT_MODE: str = "local"  # "local" or "production"

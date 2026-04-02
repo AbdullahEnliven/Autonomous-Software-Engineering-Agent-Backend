@@ -5,6 +5,7 @@ import socket
 import sys
 from app.config import settings
 from app.socketio.server import sio
+from app.utils.paths import get_project_dir
 
 
 class DeploymentService:
@@ -66,12 +67,7 @@ class DeploymentService:
             - Production mode: Returns enliven-app.com domain
         """
         # Determine project directory
-        if not settings.USER_PROJECTS_DIR:
-            backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            root_dir = os.path.dirname(backend_dir)
-            project_dir = os.path.join(root_dir, 'user_projects', project_id)
-        else:
-            project_dir = os.path.join(settings.USER_PROJECTS_DIR, project_id)
+        project_dir = str(get_project_dir(project_id))
             
         if not os.path.exists(project_dir):
             raise Exception("Project directory not found")

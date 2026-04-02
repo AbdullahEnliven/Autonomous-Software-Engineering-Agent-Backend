@@ -6,6 +6,7 @@ from app.database import async_session_maker
 from app.models.project import GenerationJob, Specification, GenerationJobStatus, Requirement
 from sqlalchemy import select
 from app.utils.template_editor import create_project_from_template
+from app.utils.paths import get_project_dir, get_template_dir
 
 async def async_generate_store(project_id: str, job_id: str, specification_id: str):
     print(f"Starting async store generation for project {project_id}, job {job_id}")
@@ -34,9 +35,8 @@ async def async_generate_store(project_id: str, job_id: str, specification_id: s
             await db.commit()
 
             # Paths
-            backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            root_dir = os.path.dirname(backend_dir)  # Points to 'ASEA' root
-            target_dir = os.path.join(root_dir, 'user_projects', project_id)
+            target_dir = str(get_project_dir(project_id))
+            template_dir = get_template_dir()
 
             # Clone and edit template
             config = {
@@ -51,8 +51,8 @@ async def async_generate_store(project_id: str, job_id: str, specification_id: s
             
             # This is synchronous but okay for a celery worker
             create_project_from_template(
-                base_dir=root_dir, 
-                template_name='ASEA-Template', 
+                base_dir=str(template_dir.parent),
+                template_name=template_dir.name,
                 target_dir=target_dir, 
                 config=config
             )
@@ -75,7 +75,7 @@ async def async_generate_store(project_id: str, job_id: str, specification_id: s
             # Windows specifically: kill existing process on this port
             subprocess.run(f'FOR /F "tokens=5" %a IN (\'netstat -aon ^| findstr :{port}\') DO taskkill /F /PID %a', shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 
-            node_modules_src = os.path.join(root_dir, 'ASEA-Template', 'node_modules')
+            node_modules_src = os.path.join(str(template_dir), 'node_modules')
             node_modules_dst = os.path.join(target_dir, 'node_modules')
             if os.path.exists(node_modules_src) and not os.path.exists(node_modules_dst):
                 subprocess.run(['cmd', '/c', 'mklink', '/J', node_modules_dst, node_modules_src], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)

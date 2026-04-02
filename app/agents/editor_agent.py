@@ -7,6 +7,7 @@ from groq import Groq
 
 from app.config import settings
 from app.agents.base_agent import BaseAgent
+from app.utils.paths import get_project_dir
 
 genai.configure(api_key=settings.GEMINI_API_KEY)
 
@@ -230,9 +231,7 @@ class EditorAgent(BaseAgent):
         """Execute a multi-step edit with real-time status updates."""
         self.log(f"Executing edit for project {project_id} with msg: {user_message}")
         
-        backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        root_dir = os.path.dirname(backend_dir)
-        target_dir = os.path.join(root_dir, 'user_projects', project_id)
+        target_dir = str(get_project_dir(project_id))
         
         if not os.path.exists(target_dir):
             return {"error": "Project directory not found. Please wait for generation."}

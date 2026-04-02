@@ -20,6 +20,7 @@ from app.services.generation_service import GenerationService
 from app.services.chat_service import ChatService
 from app.services.version_control_service import VersionControlService
 from app.services.name_selector_service import NameSelectorService
+from app.utils.paths import get_project_dir
 from pydantic import BaseModel
 from sqlalchemy.future import select
 
@@ -41,9 +42,7 @@ IGNORED_DIRS = {".git", "node_modules", "dist", "build", "__pycache__", ".pytest
 
 
 def _get_project_dir(project_id: str) -> Path:
-    backend_dir = Path(__file__).resolve().parents[2]
-    root_dir = backend_dir.parent
-    return root_dir / "user_projects" / str(project_id)
+    return get_project_dir(project_id)
 
 
 def _safe_project_path(project_id: str, file_path: str) -> Path:

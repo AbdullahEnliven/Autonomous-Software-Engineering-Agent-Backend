@@ -7,19 +7,14 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
 from app.models.project import ProjectCheckpoint
+from app.utils.paths import get_project_dir
 
 
 class VersionControlService:
     @staticmethod
     def _project_dir(project_id: str) -> str:
-        if settings.USER_PROJECTS_DIR:
-            target_dir = os.path.join(settings.USER_PROJECTS_DIR, project_id)
-        else:
-            backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            root_dir = os.path.dirname(backend_dir)
-            target_dir = os.path.join(root_dir, "user_projects", project_id)
+        target_dir = str(get_project_dir(project_id))
 
         if not os.path.exists(target_dir):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project directory not found")

@@ -2,7 +2,7 @@ import subprocess
 import os
 import hashlib
 from typing import Dict
-from app.config import settings
+from app.utils.paths import get_project_dir
 
 # In-memory dictionary to track running Vite processes
 # Mapping: project_id -> subprocess.Popen
@@ -24,13 +24,7 @@ class PreviewManager:
             
         port = PreviewManager.get_port(project_id)
         
-        # Compute user_projects dir dynamically (same as generation_tasks.py)
-        if settings.USER_PROJECTS_DIR:
-            target_dir = os.path.join(settings.USER_PROJECTS_DIR, project_id)
-        else:
-            backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            root_dir = os.path.dirname(backend_dir)
-            target_dir = os.path.join(root_dir, 'user_projects', project_id)
+        target_dir = str(get_project_dir(project_id))
         
         if not os.path.exists(target_dir):
             return # Project doesn't exist yet

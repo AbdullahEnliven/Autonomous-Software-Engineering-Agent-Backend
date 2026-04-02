@@ -48,7 +48,7 @@ async def join_project(sid, data):
 async def leave_project(sid, data):
     project_id = data.get("project_id")
     if project_id:
-        sio.leave_room(sid, project_id)
+        await sio.leave_room(sid, project_id)
         client_projects.pop(sid, None)
         print(f"Client {sid} left room: {project_id}")
         
@@ -82,7 +82,7 @@ async def handle_chat_message(sid, data):
         print(f"Failed to persist user chat message: {exc}")
     
     # Notify room the agent is thinking
-    await sio.emit("agent_typing", {"project_id": project_id}, to=sid)
+    await sio.emit("agent_typing", {"project_id": project_id}, room=project_id)
     
     # Run the agent with Socket.IO access for real-time status events
     agent = EditorAgent()
@@ -92,23 +92,27 @@ async def handle_chat_message(sid, data):
     
     if "error" in result:
         error_message = f"Sorry, I encountered an error: {result['error']}"
+        persisted = None
         try:
             async with async_session_maker() as db:
-                await ChatService.create_message(db, project_id, "agent", error_message, {"error": True})
+                persisted = await ChatService.create_message(db, project_id, "agent", error_message, {"error": True})
         except Exception as exc:
             print(f"Failed to persist agent error message: {exc}")
 
         await sio.emit("agent_reply", {
             "project_id": project_id,
+            "id": str(persisted.id) if persisted else None,
+            "role": "agent",
             "message": error_message,
             "files_modified": [],
             "plan": ""
-        }, to=sid)
+        }, room=project_id)
     else:
         agent_reply = result.get("reply", "I've updated the code for you.")
+        persisted = None
         try:
             async with async_session_maker() as db:
-                await ChatService.create_message(
+                persisted = await ChatService.create_message(
                     db,
                     project_id,
                     "agent",
@@ -123,10 +127,12 @@ async def handle_chat_message(sid, data):
 
         await sio.emit("agent_reply", {
             "project_id": project_id,
+            "id": str(persisted.id) if persisted else None,
+            "role": "agent",
             "message": agent_reply,
             "files_modified": result.get("files_modified", []),
             "plan": result.get("plan", "")
-        }, to=sid)
+        }, room=project_id)
         
         # Notify clients to trigger preview reload — HMR handles most, but emit refresh event
         await sio.emit("code_updated", {"project_id": project_id}, room=project_id)

@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     # Groq Fallback
     GROQ_API_KEY: str = ""
     GROQ_LLM_MODEL: str = "llama-3.3-70b-versatile"
+
+    # Image Personalization
+    PEXELS_API_KEY: str = ""
     
     # GitHub OAuth
     GITHUB_CLIENT_ID: str = "your-github-client-id"
@@ -38,12 +41,15 @@ class Settings(BaseSettings):
     ARTIFACT_PATH: str = "/tmp/asea/artifacts"
     USER_PROJECTS_DIR: str = ""
     
+    # Deployment
+    DEPLOYMENT_MODE: str = "local"  # "local" or "production"
+    LOCAL_DEPLOYMENT_PORT: int = 3000  # Port for local served projects
+    DEPLOYMENT_DOMAIN: str = "enliven-app.com"  # Domain for production
+    
     # Monitoring
     SENTRY_DSN: str = ""
-    
-    # Frontend
     FRONTEND_URL: str = "http://localhost:5173"
-    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:8000"]
+    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:8000", "http://localhost:3000"]
     
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

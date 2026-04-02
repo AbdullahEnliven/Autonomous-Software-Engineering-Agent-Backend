@@ -4,6 +4,8 @@ import json
 import re
 import subprocess
 
+from app.services.image_personalization_service import StoreImagePersonalizationService
+
 
 def _escape_js(value: str) -> str:
     return value.replace('"', '\\"') if isinstance(value, str) else value
@@ -67,10 +69,13 @@ def create_project_from_template(base_dir: str, template_name: str, target_dir: 
     _update_settings_store(target_dir, normalized_config)
     _update_layout_components(target_dir, normalized_config)
     _update_homepage_content(target_dir, normalized_config)
+    _personalize_homepage_images(target_dir, normalized_config)
     _update_home_splash(target_dir, normalized_config)
     _write_env_file(target_dir, normalized_config)
     # Initialize fresh Git repository for this project
     _init_git_repo(target_dir)
+
+
 def _update_package_json(target_dir: str, config: dict):
     path = os.path.join(target_dir, 'package.json')
     if not os.path.exists(path): return
@@ -213,4 +218,78 @@ def _write_env_file(target_dir: str, config: dict):
         # No .env.example found — write a minimal .env
         with open(env_path, 'w', encoding='utf-8') as f:
             f.write(f'VITE_APP_NAME={store_name}\n')
+
+
+def _personalize_homepage_images(target_dir: str, config: dict):
+    """
+    Rule-based slot mapping with AI-generated search queries:
+    - hero image in src/utils/contentApi.js
+    - discovery grid images in src/pages/Home.jsx
+    """
+    store_name = config.get('store_name', 'ASEA Store')
+    store_description = config.get('store_description', config.get('tagline', 'Modern ecommerce store'))
+
+    selected = StoreImagePersonalizationService.get_store_images(
+        store_name=store_name,
+        store_description=store_description,
+    )
+
+    if not selected:
+        return
+
+    # 1) Replace hero image in contentApi.js
+    content_api_path = os.path.join(target_dir, 'src', 'utils', 'contentApi.js')
+    if os.path.exists(content_api_path):
+        with open(content_api_path, 'r', encoding='utf-8') as f:
+            content_api = f.read()
+
+        content_api = re.sub(
+            r'heroImage:\s*".*?"',
+            f'heroImage: "{_escape_js(selected["hero"])}"',
+            content_api,
+            count=1,
+        )
+
+        with open(content_api_path, 'w', encoding='utf-8') as f:
+            f.write(content_api)
+
+    # 2) Replace first three discovery image URLs in Home.jsx
+    home_path = os.path.join(target_dir, 'src', 'pages', 'Home.jsx')
+    if os.path.exists(home_path):
+        with open(home_path, 'r', encoding='utf-8') as f:
+            home_content = f.read()
+
+        discovery_match = re.search(
+            r'(const\s+discoveryItems\s*=\s*\[)([\s\S]*?)(\]\s*;)',
+            home_content,
+        )
+
+        if discovery_match:
+            block = discovery_match.group(2)
+            replacement_urls = [selected['essentials'], selected['arrivals'], selected['sale']]
+            idx = 0
+
+            def _replace_image(match):
+                nonlocal idx
+                if idx >= len(replacement_urls):
+                    return match.group(0)
+                url = replacement_urls[idx]
+                idx += 1
+                return f'image:\n        "{_escape_js(url)}"'
+
+            updated_block = re.sub(
+                r'image:\s*\n\s*".*?"',
+                _replace_image,
+                block,
+                count=3,
+            )
+
+            home_content = (
+                home_content[:discovery_match.start(2)]
+                + updated_block
+                + home_content[discovery_match.end(2):]
+            )
+
+            with open(home_path, 'w', encoding='utf-8') as f:
+                f.write(home_content)
 

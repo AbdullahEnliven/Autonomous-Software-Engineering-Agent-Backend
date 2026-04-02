@@ -3,7 +3,7 @@ import time
 import asyncio
 from app.tasks.celery_app import celery_app
 from app.database import async_session_maker
-from app.models.project import GenerationJob, Specification, GenerationJobStatus
+from app.models.project import GenerationJob, Specification, GenerationJobStatus, Requirement
 from sqlalchemy import select
 from app.utils.template_editor import create_project_from_template
 
@@ -18,6 +18,11 @@ async def async_generate_store(project_id: str, job_id: str, specification_id: s
             
             spec_result = await db.execute(select(Specification).where(Specification.id == specification_id))
             spec = spec_result.scalars().first()
+
+            requirement = None
+            if spec:
+                requirement_result = await db.execute(select(Requirement).where(Requirement.id == spec.requirement_id))
+                requirement = requirement_result.scalars().first()
             
             if not job or not spec:
                 print("Job or Specification not found.")
@@ -37,6 +42,7 @@ async def async_generate_store(project_id: str, job_id: str, specification_id: s
             config = {
                 'store_name': spec.store_name,
                 'tagline': spec.tagline or 'Powered by ASEA',
+                'store_description': requirement.raw_text if requirement and requirement.raw_text else (spec.tagline or spec.store_name),
                 'hero_badge': spec.store_name,
                 'hero_title': f"{spec.store_name} — {spec.tagline}" if spec.tagline else f"{spec.store_name} Storefront",
                 'hero_subtitle': spec.tagline or 'A modern storefront built for you.',

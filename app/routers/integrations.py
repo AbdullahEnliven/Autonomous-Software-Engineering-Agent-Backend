@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, status, Request, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
+from pathlib import Path
 
 from app.database import get_db
 from app.dependencies import get_current_user
@@ -65,6 +66,25 @@ async def run_supabase_seed(
     current_user: User = Depends(get_current_user),
 ):
     return await IntegrationService.run_supabase_seed(db, project_id, current_user.id)
+
+
+@router.get("/supabase/init-script", status_code=status.HTTP_200_OK)
+async def get_supabase_init_script(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # Validate project access first.
+    await IntegrationService.get_supabase_status(db, project_id, current_user.id)
+
+    backend_dir = Path(__file__).resolve().parents[2]
+    root_dir = backend_dir.parent
+    script_path = root_dir / "supabasescript.txt"
+
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail="Supabase init script not found")
+
+    return {"script": script_path.read_text(encoding="utf-8")}
 
 
 @router.post(

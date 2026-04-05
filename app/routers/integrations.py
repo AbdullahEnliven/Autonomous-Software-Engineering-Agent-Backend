@@ -1,16 +1,19 @@
-from fastapi import APIRouter, Depends, status, Request, HTTPException
+from fastapi import APIRouter, Depends, status, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
 from pathlib import Path
+from app.config import settings
 
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.user import User
 from app.schemas.integration import (
+    DeployRequest,
+    DeployResponse,
     SupabaseConnectionResponse,
     SupabaseCredentials,
     SupabaseMigrationResponse,
     SupabaseStatusResponse,
+    VercelStatusResponse,
 )
 from app.services.integration_service import IntegrationService
 from app.services.deployment_service import DeploymentService
@@ -89,24 +92,109 @@ async def get_supabase_init_script(
 
 @router.post(
     "/deploy",
+    response_model=DeployResponse,
     status_code=status.HTTP_200_OK,
 )
 async def deploy_project(
     project_id: str,
-    request: Request,
+    payload: DeployRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Trigger the ASEA Cloud deployment sequence."""
+    """Deploy project (Vercel when configured, legacy fallback otherwise)."""
     try:
-        body_bytes = await request.body()
-        body = await request.json() if body_bytes else {}
         pid_str = str(project_id)
-        subdomain = body.get("subdomain", f"store-{pid_str[:5]}")
-        url = await DeploymentService.deploy_project(project_id, subdomain)
-        return {"status": "success", "message": "Deployed successfully", "url": url}
+        subdomain = payload.subdomain or f"store-{pid_str[:5]}"
+        target = payload.target or "production"
+
+        url = await DeploymentService.deploy_project_for_user(
+            db=db,
+            project_id=project_id,
+            user_id=str(current_user.id),
+            subdomain=subdomain,
+            target=target,
+        )
+        return {
+            "status": "success",
+            "message": f"{target.capitalize()} deploy successful",
+            "url": url,
+            "target": target,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
-        from fastapi import HTTPException
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/vercel/status", response_model=VercelStatusResponse)
+async def get_vercel_status(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    configured = bool(settings.VERCEL_TOKEN)
+    return await IntegrationService.get_vercel_status(db, project_id, str(current_user.id), configured)
+
+
+@router.post(
+    "/vercel/preview",
+    response_model=DeployResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def deploy_preview_to_vercel(
+    project_id: str,
+    payload: DeployRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not settings.VERCEL_TOKEN:
+        raise HTTPException(status_code=400, detail="VERCEL_TOKEN is not configured")
+
+    pid_str = str(project_id)
+    subdomain = payload.subdomain or f"store-{pid_str[:5]}"
+    url = await DeploymentService.deploy_project_for_user(
+        db=db,
+        project_id=project_id,
+        user_id=str(current_user.id),
+        subdomain=subdomain,
+        target="preview",
+    )
+    return {
+        "status": "success",
+        "message": "Preview deploy successful",
+        "url": url,
+        "target": "preview",
+    }
+
+
+@router.post(
+    "/vercel/deploy",
+    response_model=DeployResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def deploy_production_to_vercel(
+    project_id: str,
+    payload: DeployRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not settings.VERCEL_TOKEN:
+        raise HTTPException(status_code=400, detail="VERCEL_TOKEN is not configured")
+
+    pid_str = str(project_id)
+    subdomain = payload.subdomain or f"store-{pid_str[:5]}"
+    url = await DeploymentService.deploy_project_for_user(
+        db=db,
+        project_id=project_id,
+        user_id=str(current_user.id),
+        subdomain=subdomain,
+        target="production",
+    )
+    return {
+        "status": "success",
+        "message": "Production deploy successful",
+        "url": url,
+        "target": "production",
+    }

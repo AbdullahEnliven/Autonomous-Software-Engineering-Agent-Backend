@@ -3,7 +3,17 @@ import asyncio
 import subprocess
 import socket
 import sys
+import re
+import json
+from datetime import datetime
+
+from fastapi import HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.config import settings
+from app.models.project import Integration, IntegrationStatus, IntegrationType
+from app.services.integration_service import IntegrationService
+from app.services.project_service import ProjectService
 from app.socketio.server import sio
 from app.utils.paths import get_project_dir
 
@@ -66,19 +76,44 @@ class DeploymentService:
             - Local mode: Returns localhost URL with instructions
             - Production mode: Returns enliven-app.com domain
         """
+        return await DeploymentService._deploy_local_or_mock(project_id, subdomain)
+
+    @staticmethod
+    async def deploy_project_for_user(
+        db: AsyncSession,
+        project_id: str,
+        user_id: str,
+        subdomain: str,
+        target: str = "production",
+    ) -> str:
+        # Validate ownership first.
+        await ProjectService.get_project(db, project_id, user_id)
+
+        if settings.VERCEL_TOKEN:
+            return await DeploymentService._deploy_to_vercel(db, project_id, subdomain, target)
+
+        if target == "preview":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Preview deployment requires VERCEL_TOKEN to be configured.",
+            )
+
+        return await DeploymentService._deploy_local_or_mock(project_id, subdomain)
+
+    @staticmethod
+    async def _deploy_local_or_mock(project_id: str, subdomain: str) -> str:
         # Determine project directory
         project_dir = str(get_project_dir(project_id))
-            
+
         if not os.path.exists(project_dir):
             raise Exception("Project directory not found")
 
-            
         # Emit initial status
         if settings.DEPLOYMENT_MODE == "local":
             await sio.emit("deployment_log", {"line": "[LOCAL MODE] Building project for local deployment..."}, room=project_id)
         else:
             await sio.emit("deployment_log", {"line": "[PRODUCTION MODE] Deploying to ASEA Cloud..."}, room=project_id)
-            
+
         await sio.emit("deployment_log", {"line": "Authenticating with ASEA Cloud Edge..."}, room=project_id)
         await asyncio.sleep(0.5)
         await sio.emit("deployment_log", {"line": "SUCCESS: Authenticated."}, room=project_id)
@@ -153,4 +188,122 @@ class DeploymentService:
 
             # Return production URL
             return f"https://{subdomain}.{settings.DEPLOYMENT_DOMAIN}"
+
+    @staticmethod
+    async def _deploy_to_vercel(
+        db: AsyncSession,
+        project_id: str,
+        subdomain: str,
+        target: str,
+    ) -> str:
+        project_dir = str(get_project_dir(project_id))
+        if not os.path.exists(project_dir):
+            raise HTTPException(status_code=404, detail="Project directory not found")
+
+        target = (target or "production").strip().lower()
+        if target not in {"preview", "production"}:
+            raise HTTPException(status_code=400, detail="target must be 'preview' or 'production'")
+
+        await sio.emit(
+            "deployment_log",
+            {"line": f"[VERCEL] Starting {target} deployment..."},
+            room=project_id,
+        )
+
+        project_slug = f"{settings.VERCEL_PROJECT_PREFIX}-{str(project_id)[:8]}"
+        cmd = [
+            "npx",
+            "vercel@latest",
+            "deploy",
+            "--token",
+            settings.VERCEL_TOKEN,
+            "--yes",
+            "--name",
+            project_slug,
+        ]
+
+        if settings.VERCEL_SCOPE:
+            cmd.extend(["--scope", settings.VERCEL_SCOPE])
+        if target == "production":
+            cmd.append("--prod")
+
+        env = os.environ.copy()
+        env["CI"] = "1"
+
+        process = subprocess.Popen(
+            cmd,
+            cwd=project_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+        )
+
+        output_lines = []
+        while True:
+            line = await asyncio.to_thread(process.stdout.readline)
+            if not line:
+                break
+            cleaned = line.strip()
+            output_lines.append(cleaned)
+            if cleaned:
+                await sio.emit("deployment_log", {"line": cleaned}, room=project_id)
+
+        return_code = await asyncio.to_thread(process.wait)
+        output_text = "\n".join(output_lines)
+        url = DeploymentService._extract_vercel_url(output_text)
+
+        if return_code != 0 or not url:
+            raise HTTPException(
+                status_code=500,
+                detail="Vercel deployment failed. Check deployment logs for details.",
+            )
+
+        integration = await IntegrationService._get_integration(db, project_id, IntegrationType.vercel)
+        current_payload = {}
+        if integration and integration.encrypted_credentials:
+            try:
+                current_payload = json.loads(integration.encrypted_credentials)
+            except json.JSONDecodeError:
+                current_payload = {}
+
+        if target == "preview":
+            current_payload["preview_url"] = url
+        else:
+            current_payload["production_url"] = url
+        current_payload["project_slug"] = project_slug
+        current_payload["last_target"] = target
+        current_payload["last_deployed_at"] = datetime.utcnow().isoformat()
+
+        if integration is None:
+            integration = Integration(
+                project_id=project_id,
+                type=IntegrationType.vercel,
+                encrypted_credentials=json.dumps(current_payload),
+                status=IntegrationStatus.connected,
+                connected_at=datetime.utcnow(),
+            )
+            db.add(integration)
+        else:
+            integration.encrypted_credentials = json.dumps(current_payload)
+            integration.status = IntegrationStatus.connected
+            integration.connected_at = datetime.utcnow()
+
+        await db.commit()
+        return url
+
+    @staticmethod
+    def _extract_vercel_url(output_text: str) -> str | None:
+        if not output_text:
+            return None
+
+        matches = re.findall(r"https://[a-zA-Z0-9.-]+\\.vercel\\.app", output_text)
+        if matches:
+            return matches[-1]
+
+        generic_matches = re.findall(r"https://[a-zA-Z0-9._~:/?#\[\]@!$&'()*+,;=%-]+", output_text)
+        if generic_matches:
+            return generic_matches[-1]
+
+        return None
 

@@ -53,6 +53,7 @@ def _safe_project_path(project_id: str, file_path: str) -> Path:
         raise HTTPException(status_code=400, detail="Invalid file path")
     return candidate
 
+@router.get("", response_model=List[ProjectResponse])
 @router.get("/", response_model=List[ProjectResponse])
 async def list_projects(
     db: AsyncSession = Depends(get_db),
@@ -61,6 +62,7 @@ async def list_projects(
     """List all projects for the current user."""
     return await ProjectService.get_projects(db, current_user.id)
 
+@router.post("", status_code=status.HTTP_201_CREATED)
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def create_project(
     project_in: ProjectCreate,

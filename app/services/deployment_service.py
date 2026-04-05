@@ -5,6 +5,7 @@ import socket
 import sys
 import re
 import json
+import shutil
 from datetime import datetime
 
 from fastapi import HTTPException, status
@@ -190,6 +191,16 @@ class DeploymentService:
             return f"https://{subdomain}.{settings.DEPLOYMENT_DOMAIN}"
 
     @staticmethod
+    def _build_vercel_project_slug(project_id: str) -> str:
+        base = f"{settings.VERCEL_PROJECT_PREFIX}-{str(project_id)[:8]}".lower()
+        # Vercel allows lowercase letters, digits, '.', '_', '-'; disallow triple-dash.
+        base = re.sub(r"[^a-z0-9._-]", "-", base)
+        base = re.sub(r"-{3,}", "--", base)
+        base = re.sub(r"^-+", "", base)
+        base = re.sub(r"-+$", "", base)
+        return (base or f"asea-{str(project_id)[:8]}")[:100]
+
+    @staticmethod
     async def _deploy_to_vercel(
         db: AsyncSession,
         project_id: str,
@@ -210,48 +221,93 @@ class DeploymentService:
             room=project_id,
         )
 
-        project_slug = f"{settings.VERCEL_PROJECT_PREFIX}-{str(project_id)[:8]}"
-        cmd = [
-            "npx",
-            "vercel@latest",
-            "deploy",
-            "--token",
-            settings.VERCEL_TOKEN,
-            "--yes",
-            "--name",
-            project_slug,
-        ]
+        npx_bin = shutil.which("npx") or shutil.which("npx.cmd")
+        if not npx_bin:
+            raise HTTPException(
+                status_code=500,
+                detail="Node.js/npm is required for Vercel deploys. 'npx' was not found in PATH.",
+            )
 
-        if settings.VERCEL_SCOPE:
-            cmd.extend(["--scope", settings.VERCEL_SCOPE])
-        if target == "production":
-            cmd.append("--prod")
-
+        project_slug = DeploymentService._build_vercel_project_slug(project_id)
         env = os.environ.copy()
         env["CI"] = "1"
 
-        process = subprocess.Popen(
-            cmd,
-            cwd=project_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env,
-        )
+        async def run_vercel_deploy(use_scope: bool) -> tuple[int, str, str | None]:
+            if os.name == "nt":
+                cmd = [
+                    "cmd",
+                    "/c",
+                    "npx",
+                    "--yes",
+                    "vercel@latest",
+                    "deploy",
+                    "--token",
+                    settings.VERCEL_TOKEN,
+                    "--yes",
+                    "--name",
+                    project_slug,
+                ]
+            else:
+                cmd = [
+                    npx_bin,
+                    "--yes",
+                    "vercel@latest",
+                    "deploy",
+                    "--token",
+                    settings.VERCEL_TOKEN,
+                    "--yes",
+                    "--name",
+                    project_slug,
+                ]
 
-        output_lines = []
-        while True:
-            line = await asyncio.to_thread(process.stdout.readline)
-            if not line:
-                break
-            cleaned = line.strip()
-            output_lines.append(cleaned)
-            if cleaned:
-                await sio.emit("deployment_log", {"line": cleaned}, room=project_id)
+            if use_scope and settings.VERCEL_SCOPE:
+                cmd.extend(["--scope", settings.VERCEL_SCOPE])
+            if target == "production":
+                cmd.append("--prod")
 
-        return_code = await asyncio.to_thread(process.wait)
-        output_text = "\n".join(output_lines)
-        url = DeploymentService._extract_vercel_url(output_text)
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    cwd=project_dir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=env,
+                )
+            except FileNotFoundError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Unable to launch Vercel CLI process. Ensure Node.js and npm are installed and available in PATH.",
+                ) from exc
+
+            output_lines = []
+            while True:
+                line = await asyncio.to_thread(process.stdout.readline)
+                if not line:
+                    break
+                cleaned = line.strip()
+                output_lines.append(cleaned)
+                if cleaned:
+                    await sio.emit("deployment_log", {"line": cleaned}, room=project_id)
+
+            return_code = await asyncio.to_thread(process.wait)
+            output_text = "\n".join(output_lines)
+            return return_code, output_text, DeploymentService._extract_vercel_url(output_text)
+
+        use_scope = bool(settings.VERCEL_SCOPE)
+        return_code, output_text, url = await run_vercel_deploy(use_scope=use_scope)
+
+        if (
+            return_code != 0
+            and use_scope
+            and ("scope does not exist" in output_text.lower() or "scope-not-existent" in output_text.lower())
+        ):
+            await sio.emit(
+                "deployment_log",
+                {"line": "[VERCEL] Scope is invalid for this token. Retrying deploy without --scope..."},
+                room=project_id,
+            )
+            return_code, output_text, url = await run_vercel_deploy(use_scope=False)
 
         if return_code != 0 or not url:
             raise HTTPException(

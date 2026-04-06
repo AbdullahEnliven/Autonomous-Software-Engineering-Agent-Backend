@@ -27,3 +27,25 @@ class SupabaseMigrationResponse(BaseModel):
     project_id: str
     status: str
     message: str
+
+
+class VercelStatusResponse(BaseModel):
+    configured: bool
+    connected: bool
+    project_id: str
+    type: str
+    status: str
+    preview_url: str | None = None
+    production_url: str | None = None
+
+
+class DeployRequest(BaseModel):
+    subdomain: str | None = None
+    target: str = "production"
+
+
+class DeployResponse(BaseModel):
+    status: str
+    message: str
+    url: str
+    target: str

@@ -23,6 +23,7 @@ class GenerationJobStatus(str, enum.Enum):
 class IntegrationType(str, enum.Enum):
     supabase = "supabase"
     github = "github"
+    vercel = "vercel"
 
 class IntegrationStatus(str, enum.Enum):
     pending = "pending"

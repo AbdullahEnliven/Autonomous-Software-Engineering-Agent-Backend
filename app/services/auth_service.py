@@ -8,10 +8,14 @@ from app.schemas.auth import UserCreate, UserLogin, Token
 from app.utils.security import get_password_hash, verify_password, create_access_token, create_refresh_token
 
 class AuthService:
+    @staticmethod
+    def _normalize_email(email: str) -> str:
+        return (email or "").strip().lower()
     
     @staticmethod
     async def register_user(db: AsyncSession, user_in: UserCreate) -> User:
-        result = await db.execute(select(User).where(User.email == user_in.email))
+        normalized_email = AuthService._normalize_email(user_in.email)
+        result = await db.execute(select(User).where(User.email == normalized_email))
         if result.scalars().first():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -20,7 +24,7 @@ class AuthService:
             
         hashed_password = get_password_hash(user_in.password)
         db_user = User(
-            email=user_in.email,
+            email=normalized_email,
             hashed_password=hashed_password,
             full_name=user_in.full_name
         )
@@ -39,10 +43,27 @@ class AuthService:
 
     @staticmethod
     async def authenticate_user(db: AsyncSession, user_in: UserLogin) -> tuple[str, str]:
-        result = await db.execute(select(User).where(User.email == user_in.email))
+        normalized_email = AuthService._normalize_email(user_in.email)
+        result = await db.execute(select(User).where(User.email == normalized_email))
         user = result.scalars().first()
-        
-        if not user or not verify_password(user_in.password, user.hashed_password):
+
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        password_ok = verify_password(user_in.password, user.hashed_password)
+
+        # Legacy compatibility: if an old row stored plaintext password, allow one-time login
+        # and immediately upgrade to bcrypt hash.
+        if not password_ok and user.hashed_password == user_in.password:
+            user.hashed_password = get_password_hash(user_in.password)
+            await db.commit()
+            password_ok = True
+
+        if not password_ok:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect email or password",

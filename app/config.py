@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     DEPLOYMENT_MODE: str = "local"  # "local" or "production"
     LOCAL_DEPLOYMENT_PORT: int = 3000  # Port for local served projects
     DEPLOYMENT_DOMAIN: str = "enliven-app.com"  # Domain for production
+
+    # Vercel deployment (single account used for all user projects)
+    VERCEL_TOKEN: str = ""
+    VERCEL_SCOPE: str = ""  # Optional team/user scope slug
+    VERCEL_TEAM_ID: str = ""  # Optional team id
+    VERCEL_PROJECT_PREFIX: str = "asea"
     
     # Monitoring
     SENTRY_DSN: str = ""

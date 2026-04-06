@@ -13,14 +13,20 @@ from app.services.project_service import ProjectService
 
 class IntegrationService:
     @staticmethod
-    async def _get_supabase_integration(db: AsyncSession, project_id: str) -> Integration | None:
+    async def _get_integration(
+        db: AsyncSession, project_id: str, integration_type: IntegrationType
+    ) -> Integration | None:
         result = await db.execute(
             select(Integration).where(
                 Integration.project_id == project_id,
-                Integration.type == IntegrationType.supabase,
+                Integration.type == integration_type,
             )
         )
         return result.scalars().first()
+
+    @staticmethod
+    async def _get_supabase_integration(db: AsyncSession, project_id: str) -> Integration | None:
+        return await IntegrationService._get_integration(db, project_id, IntegrationType.supabase)
 
     @staticmethod
     async def _verify_supabase_credentials(credentials: SupabaseCredentials) -> None:
@@ -144,3 +150,35 @@ class IntegrationService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Connect your Supabase project before generation.",
             )
+
+    @staticmethod
+    async def get_vercel_status(db: AsyncSession, project_id: str, user_id: str, configured: bool) -> dict:
+        await ProjectService.get_project(db, project_id, user_id)
+        integration = await IntegrationService._get_integration(db, project_id, IntegrationType.vercel)
+
+        if not integration:
+            return {
+                "configured": configured,
+                "connected": False,
+                "project_id": project_id,
+                "type": IntegrationType.vercel.value,
+                "status": IntegrationStatus.pending.value,
+                "preview_url": None,
+                "production_url": None,
+            }
+
+        parsed = {}
+        try:
+            parsed = json.loads(integration.encrypted_credentials or "{}")
+        except json.JSONDecodeError:
+            parsed = {}
+
+        return {
+            "configured": configured,
+            "connected": integration.status == IntegrationStatus.connected,
+            "project_id": project_id,
+            "type": integration.type.value,
+            "status": integration.status.value,
+            "preview_url": parsed.get("preview_url"),
+            "production_url": parsed.get("production_url"),
+        }

@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import re
 from typing import Dict, Any, List, Optional
 import google.generativeai as genai
 from groq import Groq
@@ -183,9 +184,10 @@ class EditorAgent(BaseAgent):
         1. Analyze the current codebase and understand the existing patterns and styles.
         2. Plan the minimal set of changes needed to fulfill the user's request.
         3. You can MODIFY existing files or CREATE new ones.
-        4. Return the COMPLETE updated content for each file (not just diffs).
-        5. Maintain existing code style, imports, and patterns.
-        6. Ensure all React components remain valid JSX.
+        4. Prefer PATCH-style edits for existing files using exact find/replace snippets.
+        5. Do NOT rewrite whole files for small tasks (e.g., add social links in footer).
+        6. Preserve all unrelated code, structure, imports, and existing behavior.
+        7. Ensure all React components remain valid JSX.
 
         Return ONLY valid JSON in this exact format:
         {{
@@ -193,13 +195,22 @@ class EditorAgent(BaseAgent):
             "agent_reply": "A friendly, concise message to the user summarizing the changes made.",
             "changes": [
                 {{
-                    "file_path": "src/pages/Home.jsx",
-                    "action": "modify",
-                    "content": "...full file content..."
+                    "file_path": "src/components/Footer.jsx",
+                    "action": "patch",
+                    "edits": [
+                        {{
+                            "old_text": "...exact old snippet...",
+                            "new_text": "...replacement snippet..."
+                        }}
+                    ]
                 }}
             ],
-            "files_modified": ["src/pages/Home.jsx"]
+            "files_modified": ["src/components/Footer.jsx"]
         }}
+
+        Notes:
+        - Use action "create" with "content" only for brand new files.
+        - Use action "modify" with full "content" ONLY if user explicitly asks to rewrite/rebuild entire file.
         """
 
     def _build_fallback_prompt(self, user_message: str, file_tree: str, context: str) -> str:
@@ -217,15 +228,44 @@ class EditorAgent(BaseAgent):
         {{
           "plan": "short plan",
           "agent_reply": "short summary",
-          "changes": [{{"file_path":"src/file.jsx","action":"modify","content":"full updated file"}}],
+          "changes": [{{"file_path":"src/file.jsx","action":"patch","edits":[{{"old_text":"...","new_text":"..."}}]}}],
           "files_modified": ["src/file.jsx"]
         }}
 
         Rules:
         - Keep edits minimal and targeted.
         - Modify only necessary files.
+        - Preserve unrelated code; do not remove existing sections unless asked.
         - Ensure valid JSX/JS syntax.
         """
+
+    def _is_full_rewrite_requested(self, user_message: str) -> bool:
+        msg = (user_message or "").lower()
+        rewrite_keywords = [
+            "rewrite",
+            "rebuild",
+            "replace entire",
+            "from scratch",
+            "overhaul",
+            "redo whole",
+        ]
+        return any(k in msg for k in rewrite_keywords)
+
+    def _apply_patch_edits(self, existing: str, edits: List[Dict[str, Any]]) -> str:
+        updated = existing
+        for edit in edits:
+            old_text = edit.get("old_text")
+            new_text = edit.get("new_text", "")
+            if not isinstance(old_text, str) or not isinstance(new_text, str) or not old_text:
+                continue
+
+            # Replace only the first exact match to avoid broad destructive edits.
+            if old_text in updated:
+                updated = updated.replace(old_text, new_text, 1)
+            else:
+                # If exact matching fails, keep file unchanged for this edit.
+                self.log("Patch edit skipped: old_text not found exactly.")
+        return updated
 
     async def execute_edit(self, project_id: str, user_message: str) -> Dict[str, Any]:
         """Execute a multi-step edit with real-time status updates."""
@@ -319,7 +359,7 @@ class EditorAgent(BaseAgent):
             "step": 4, "total_steps": 4, "files": files_modified
         })
         
-        await self._apply_changes(target_dir, changes)
+        await self._apply_changes(target_dir, changes, user_message)
         
         # Done
         await self._emit_status("complete", "All changes applied successfully!", {
@@ -332,21 +372,60 @@ class EditorAgent(BaseAgent):
             "files_modified": files_modified
         }
             
-    async def _apply_changes(self, target_dir: str, changes: List[Dict[str, Any]]):
+    async def _apply_changes(self, target_dir: str, changes: List[Dict[str, Any]], user_message: str):
         """Write file changes to disk."""
+        rewrite_allowed = self._is_full_rewrite_requested(user_message)
+
         for change in changes:
             rel_path = change.get("file_path")
-            content = change.get("content")
-            if not isinstance(rel_path, str) or not isinstance(content, str):
+            action = (change.get("action") or "patch").lower()
+            if not isinstance(rel_path, str):
                 continue
-                
+
             file_path = os.path.join(target_dir, str(rel_path))
             # Security: ensure path stays within target_dir
             if not os.path.abspath(file_path).startswith(os.path.abspath(target_dir)):
                 self.log(f"Warning: path traversal attempt prevented: {rel_path}")
                 continue
-                
+
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(str(content))
-            self.log(f"Wrote file: {rel_path}")
+
+            # Preferred path: patch existing files with targeted edits.
+            edits = change.get("edits") if isinstance(change.get("edits"), list) else []
+            if action == "patch" and edits:
+                if not os.path.exists(file_path):
+                    self.log(f"Patch skipped, file missing: {rel_path}")
+                    continue
+                with open(file_path, "r", encoding="utf-8") as f:
+                    existing = f.read()
+                updated = self._apply_patch_edits(existing, edits)
+                if updated != existing:
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(updated)
+                    self.log(f"Patched file: {rel_path}")
+                else:
+                    self.log(f"No effective patch changes for: {rel_path}")
+                continue
+
+            content = change.get("content")
+            if not isinstance(content, str):
+                continue
+
+            if action == "create":
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(str(content))
+                self.log(f"Created file: {rel_path}")
+                continue
+
+            if action == "modify":
+                # Guardrail: avoid destructive full rewrites unless explicitly asked.
+                if os.path.exists(file_path) and not rewrite_allowed:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        existing = f.read()
+                    if existing and len(content) < int(len(existing) * 0.6):
+                        self.log(f"Blocked destructive rewrite for: {rel_path}")
+                        continue
+
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(str(content))
+                self.log(f"Modified file: {rel_path}")

@@ -191,8 +191,15 @@ class DeploymentService:
             return f"https://{subdomain}.{settings.DEPLOYMENT_DOMAIN}"
 
     @staticmethod
-    def _build_vercel_project_slug(project_id: str) -> str:
-        base = f"{settings.VERCEL_PROJECT_PREFIX}-{str(project_id)[:8]}".lower()
+    def _build_vercel_project_slug(project_id: str, preferred_slug: str | None = None) -> str:
+        seed = (preferred_slug or "").strip().lower()
+        if seed:
+            seed = re.sub(r"[^a-z0-9._-]", "-", seed)
+            seed = re.sub(r"-{3,}", "--", seed)
+            seed = re.sub(r"^-+", "", seed)
+            seed = re.sub(r"-+$", "", seed)
+
+        base = seed or f"{settings.VERCEL_PROJECT_PREFIX}-{str(project_id)[:8]}".lower()
         # Vercel allows lowercase letters, digits, '.', '_', '-'; disallow triple-dash.
         base = re.sub(r"[^a-z0-9._-]", "-", base)
         base = re.sub(r"-{3,}", "--", base)
@@ -228,7 +235,7 @@ class DeploymentService:
                 detail="Node.js/npm is required for Vercel deploys. 'npx' was not found in PATH.",
             )
 
-        project_slug = DeploymentService._build_vercel_project_slug(project_id)
+        project_slug = DeploymentService._build_vercel_project_slug(project_id, subdomain)
         env = os.environ.copy()
         env["CI"] = "1"
 

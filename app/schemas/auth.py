@@ -16,6 +16,16 @@ class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
 
+
+class GithubOAuthUrlResponse(BaseModel):
+    auth_url: str
+    state: str
+
+
+class GithubOAuthCallbackRequest(BaseModel):
+    code: str
+    state: str
+
 class UserResponse(BaseModel):
     id: uuid.UUID
     email: EmailStr

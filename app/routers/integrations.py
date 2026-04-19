@@ -9,6 +9,13 @@ from app.models.user import User
 from app.schemas.integration import (
     DeployRequest,
     DeployResponse,
+    GithubConnectRequest,
+    GithubConnectResponse,
+    GithubOAuthUrlResponse,
+    GithubOrgsResponse,
+    GithubPushRequest,
+    GithubPushResponse,
+    GithubStatusResponse,
     SupabaseConnectionResponse,
     SupabaseCredentials,
     SupabaseMigrationResponse,
@@ -19,6 +26,68 @@ from app.services.integration_service import IntegrationService
 from app.services.deployment_service import DeploymentService
 
 router = APIRouter()
+
+
+@router.get("/github/oauth-url", response_model=GithubOAuthUrlResponse)
+async def get_github_oauth_url(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await IntegrationService.get_github_oauth_url(db, project_id, str(current_user.id))
+
+
+@router.post("/github/connect", response_model=GithubConnectResponse)
+async def connect_github(
+    project_id: str,
+    payload: GithubConnectRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await IntegrationService.connect_github(
+        db,
+        project_id,
+        str(current_user.id),
+        payload.code,
+        payload.state,
+    )
+
+
+@router.get("/github/status", response_model=GithubStatusResponse)
+async def get_github_status(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await IntegrationService.get_github_status(db, project_id, str(current_user.id))
+
+
+@router.get("/github/orgs", response_model=GithubOrgsResponse)
+async def get_github_orgs(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await IntegrationService.get_github_orgs(db, project_id, str(current_user.id))
+
+
+@router.post("/github/push", response_model=GithubPushResponse)
+async def push_to_github(
+    project_id: str,
+    payload: GithubPushRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await IntegrationService.push_to_github(
+        db,
+        project_id,
+        str(current_user.id),
+        repo_name=payload.repoName.strip(),
+        is_private=payload.isPrivate,
+        branch=payload.branch.strip(),
+        commit_message=payload.commitMessage.strip(),
+        owner=payload.owner.strip() if payload.owner else None,
+    )
 
 
 @router.get("/supabase/status", response_model=SupabaseStatusResponse)

@@ -1,9 +1,16 @@
-from fastapi import APIRouter, Depends, Response, HTTPException, status
+from fastapi import APIRouter, Depends, Response, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.security import OAuth2PasswordRequestForm
 
 from app.database import get_db
-from app.schemas.auth import UserCreate, UserResponse, Token, UserLogin
+from app.schemas.auth import (
+    UserCreate,
+    UserResponse,
+    Token,
+    UserLogin,
+    GithubOAuthUrlResponse,
+    GithubOAuthCallbackRequest,
+)
 from app.services.auth_service import AuthService
 from app.dependencies import get_current_user
 
@@ -80,3 +87,37 @@ async def logout(response: Response):
     """Logout by clearing refresh token."""
     response.delete_cookie(key="refresh_token")
     return {"message": "Logged out successfully"}
+
+
+@router.get("/oauth/github/url", response_model=GithubOAuthUrlResponse)
+async def github_oauth_url(source: str = Query(default="login", pattern="^(login|register)$")):
+    """Get GitHub OAuth authorize URL for auth login/signup."""
+    return await AuthService.get_github_oauth_url(source)
+
+
+@router.post("/oauth/github")
+async def github_oauth_callback(
+    payload: GithubOAuthCallbackRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """Exchange GitHub OAuth code and authenticate (login/signup)."""
+    user, access_token, refresh_token = await AuthService.authenticate_with_github_code(
+        db,
+        payload.code,
+        payload.state,
+    )
+
+    response.set_cookie(
+        key="refresh_token",
+        value=refresh_token,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=30 * 24 * 60 * 60,
+    )
+
+    return {
+        "user": user,
+        "token": access_token,
+    }

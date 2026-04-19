@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     # GitHub OAuth
     GITHUB_CLIENT_ID: str = "your-github-client-id"
     GITHUB_CLIENT_SECRET: str = "your-github-client-secret"
-    GITHUB_REDIRECT_URI: str = "http://localhost:8000/api/v1/integrations/github/callback"
+    GITHUB_REDIRECT_URI: str = "http://localhost:5173/auth/github/callback"
     
     # Google OAuth
     GOOGLE_CLIENT_ID: str = "your-google-client-id"

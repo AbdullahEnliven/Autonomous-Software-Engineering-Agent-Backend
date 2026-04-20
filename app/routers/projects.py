@@ -7,7 +7,7 @@ import hashlib
 import tempfile
 import zipfile
 
-from app.database import get_db
+from app.database import get_db, async_session_maker
 from app.models.user import User
 from app.models.project import Specification, GenerationJobStatus
 from app.dependencies import get_current_user
@@ -20,6 +20,7 @@ from app.services.generation_service import GenerationService
 from app.services.chat_service import ChatService
 from app.services.version_control_service import VersionControlService
 from app.services.name_selector_service import NameSelectorService
+from app.services.preview_manager import PreviewManager
 from app.utils.paths import get_project_dir
 from pydantic import BaseModel
 from sqlalchemy.future import select
@@ -394,10 +395,29 @@ async def download_project_zip(
 @router.get("/{project_id}/preview/{page}")
 async def get_project_preview(project_id: str, page: str, current_user: User = Depends(get_current_user)):
     """Return specific preview HTML based on stable generated port."""
+        # Ensure user has access to the project before serving preview markup.
+        async with async_session_maker() as db:
+                await ProjectService.get_project(db, project_id, current_user.id)
+
     # Deterministic port based on Project ID
     base_hash = int(hashlib.md5(str(project_id).encode()).hexdigest(), 16)
     port = 6000 + (base_hash % 3000)
-    
-    return f"""<style>body {{ margin: 0; padding: 0; overflow: hidden; }} iframe {{ width: 100vw; height: 100vh; border: none; }}</style><iframe src="http://localhost:{port}/{"" if page == "home" else page.lower()}"></iframe>"""
+
+        is_ready = await PreviewManager.ensure_preview_ready(project_id, timeout_seconds=10.0)
+        if not is_ready:
+                return """
+                <style>
+                    body { margin:0; font-family: Arial, sans-serif; background:#0f172a; color:#e5e7eb; display:flex; align-items:center; justify-content:center; min-height:100vh; }
+                    .card { max-width:560px; padding:24px; border:1px solid rgba(255,255,255,.12); border-radius:14px; background:rgba(255,255,255,.04); }
+                    h2 { margin:0 0 8px 0; font-size:20px; }
+                    p { margin:0; color:#cbd5e1; line-height:1.45; }
+                </style>
+                <div class='card'>
+                    <h2>Preview is still starting</h2>
+                    <p>Your local preview server is waking up. Please click refresh in a few seconds.</p>
+                </div>
+                """
+
+        return f"""<style>body {{ margin: 0; padding: 0; overflow: hidden; }} iframe {{ width: 100vw; height: 100vh; border: none; }}</style><iframe src="http://localhost:{port}/{"" if page == "home" else page.lower()}"></iframe>"""
 
 

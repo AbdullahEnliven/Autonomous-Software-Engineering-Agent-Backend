@@ -95,8 +95,11 @@ class AuthService:
                         "Authorization": f"Bearer {access_token}",
                         "Accept": "application/vnd.github+json",
                         "X-GitHub-Api-Version": "2022-11-28",
+                        "User-Agent": "ASEA-App",
                     },
                 )
+                if user_res.status_code >= 400:
+                    raise HTTPException(status_code=400, detail=f"GitHub API Error: {user_res.status_code} {user_res.text}")
                 user_res.raise_for_status()
                 gh_user = user_res.json()
 
@@ -108,8 +111,11 @@ class AuthService:
                             "Authorization": f"Bearer {access_token}",
                             "Accept": "application/vnd.github+json",
                             "X-GitHub-Api-Version": "2022-11-28",
+                            "User-Agent": "ASEA-App",
                         },
                     )
+                    if emails_res.status_code >= 400:
+                        raise HTTPException(status_code=400, detail=f"GitHub Emails API Error: {emails_res.status_code} {emails_res.text}")
                     emails_res.raise_for_status()
                     emails = emails_res.json() or []
                     primary = next((e for e in emails if e.get("primary") and e.get("verified")), None)

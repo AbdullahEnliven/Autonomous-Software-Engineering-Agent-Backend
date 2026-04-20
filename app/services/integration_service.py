@@ -367,8 +367,11 @@ class IntegrationService:
                         "Authorization": f"Bearer {access_token}",
                         "Accept": "application/vnd.github+json",
                         "X-GitHub-Api-Version": "2022-11-28",
+                        "User-Agent": "ASEA-App",
                     },
                 )
+                if user_res.status_code >= 400:
+                    raise HTTPException(status_code=400, detail=f"GitHub API Error: {user_res.status_code} {user_res.text}")
                 user_res.raise_for_status()
                 gh_user = user_res.json()
         except HTTPException:

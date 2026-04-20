@@ -10,7 +10,11 @@ from app.schemas.project import ProjectCreate, ProjectUpdate
 class ProjectService:
     @staticmethod
     async def get_projects(db: AsyncSession, user_id: str):
-        result = await db.execute(select(Project).where(Project.user_id == user_id))
+        result = await db.execute(
+            select(Project)
+            .where(Project.user_id == user_id)
+            .order_by(Project.created_at.desc())
+        )
         return result.scalars().all()
 
     @staticmethod

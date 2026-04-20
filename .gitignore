@@ -9,3 +9,10 @@ wheels/
 # Virtual environments
 .venv
 .env
+.env.development.local
+# Logs
+logs
+*.log
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json

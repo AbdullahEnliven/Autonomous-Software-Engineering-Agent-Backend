@@ -3,11 +3,10 @@ import time
 import asyncio
 from app.tasks.celery_app import celery_app
 from app.database import async_session_maker
-from app.models.project import GenerationJob, Specification, GenerationJobStatus, Requirement, Project, ProjectStatus
+from app.models.project import GenerationJob, Specification, GenerationJobStatus, Requirement
 from sqlalchemy import select
 from app.utils.template_editor import create_project_from_template
 from app.utils.paths import get_project_dir, get_template_dir
-from app.services.project_service import ProjectService
 
 async def async_generate_store(project_id: str, job_id: str, specification_id: str):
     print(f"Starting async store generation for project {project_id}, job {job_id}")
@@ -90,13 +89,6 @@ async def async_generate_store(project_id: str, job_id: str, specification_id: s
             job.progress = 100
             job.status = GenerationJobStatus.complete
             job.current_step = "Generation completed successfully"
-
-            project_result = await db.execute(select(Project).where(Project.id == project_id))
-            project = project_result.scalars().first()
-            if project:
-                project.status = ProjectStatus.ready
-                project.thumbnail_url = ProjectService.build_generated_thumbnail_url(project.name)
-
             await db.commit()
 
             print(f"Completed store generation for project {project_id} at {target_dir}")

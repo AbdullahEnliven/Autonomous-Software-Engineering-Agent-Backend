@@ -12,7 +12,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models.project import Integration, IntegrationStatus, IntegrationType, ProjectStatus
+from app.models.project import Integration, IntegrationStatus, IntegrationType
 from app.services.integration_service import IntegrationService
 from app.services.project_service import ProjectService
 from app.socketio.server import sio
@@ -88,16 +88,10 @@ class DeploymentService:
         target: str = "production",
     ) -> str:
         # Validate ownership first.
-        project = await ProjectService.get_project(db, project_id, user_id)
-
-        if project.status != ProjectStatus.deployed:
-            project.status = ProjectStatus.deployed
+        await ProjectService.get_project(db, project_id, user_id)
 
         if settings.VERCEL_TOKEN:
-            url = await DeploymentService._deploy_to_vercel(db, project_id, subdomain, target)
-            project.thumbnail_url = ProjectService.build_deployed_thumbnail_url(project.name, url)
-            await db.commit()
-            return url
+            return await DeploymentService._deploy_to_vercel(db, project_id, subdomain, target)
 
         if target == "preview":
             raise HTTPException(
@@ -105,10 +99,7 @@ class DeploymentService:
                 detail="Preview deployment requires VERCEL_TOKEN to be configured.",
             )
 
-        url = await DeploymentService._deploy_local_or_mock(project_id, subdomain)
-        project.thumbnail_url = ProjectService.build_deployed_thumbnail_url(project.name, url)
-        await db.commit()
-        return url
+        return await DeploymentService._deploy_local_or_mock(project_id, subdomain)
 
     @staticmethod
     async def _deploy_local_or_mock(project_id: str, subdomain: str) -> str:

@@ -30,13 +30,15 @@ class EditorAgent(BaseAgent):
     FALLBACK_FILE_TREE_LINES = 28
     
     def __init__(self):
-        self.gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-        
-        # Groq Fallback Client
+        # Always use Groq client first, fallback currently acts as the primary
         self.groq_client = None
         if settings.GROQ_API_KEY:
             self.groq_client = Groq(api_key=settings.GROQ_API_KEY)
             self.groq_model = settings.GROQ_LLM_MODEL
+            
+        self.gemini_model = None
+        if settings.GEMINI_API_KEY:
+            self.gemini_model = genai.GenerativeModel("gemini-1.5-flash")
         
         # Socket.IO references for real-time status
         self.sio = None
@@ -306,22 +308,10 @@ class EditorAgent(BaseAgent):
         prompt = self._build_prompt(user_message, file_tree, context)
         
         try:
-            self.log("Attempting Gemini model for EditorAgent")
-            response = self.gemini_model.generate_content(
-                prompt,
-                generation_config=genai.GenerationConfig(
-                    response_mime_type="application/json",
-                )
-            )
-            raw_json = response.text
-            self.log("Received response from Gemini EditorAgent")
-            parsed_response = json.loads(raw_json)
-            
-        except Exception as e:
-            self.log(f"Gemini editing failed: {str(e)}")
             if self.groq_client:
-                self.log(f"Falling back to Groq model {self.groq_model}")
-                await self._emit_status("planning", "Switching to fallback AI model...", {"step": 3, "total_steps": 4})
+                self.log(f"Attempting Groq model {self.groq_model}")
+                await self._emit_status("planning", f"Planning changes with Groq {self.groq_model}...", {"step": 3, "total_steps": 4})
+                
                 try:
                     fallback_files = ranked_files[:self.FALLBACK_MAX_CONTEXT_FILES]
                     fallback_tree = self._build_file_tree(target_dir, max_lines=self.FALLBACK_FILE_TREE_LINES)
@@ -344,12 +334,41 @@ class EditorAgent(BaseAgent):
                     self.log("Received response from Groq EditorAgent")
                     parsed_response = json.loads(raw_json)
                 except Exception as groq_e:
-                    self.log(f"Groq fallback failed: {str(groq_e)}")
-                    await self._emit_status("error", "Failed to generate changes", {"step": 3, "total_steps": 4})
-                    return {"error": f"Editing failed on both Gemini and Groq. Error: {str(groq_e)}"}
+                    self.log(f"Groq failed: {str(groq_e)}")
+                    if self.gemini_model:
+                        self.log("Falling back to Gemini model")
+                        await self._emit_status("planning", "Groq failed, switching to Gemini API...", {"step": 3, "total_steps": 4})
+                        response = self.gemini_model.generate_content(
+                            prompt,
+                            generation_config=genai.GenerationConfig(
+                                response_mime_type="application/json",
+                            )
+                        )
+                        raw_json = response.text
+                        self.log("Received response from Gemini EditorAgent via fallback")
+                        parsed_response = json.loads(raw_json)
+                    else:
+                        await self._emit_status("error", "Failed to generate changes via Groq (No Gemini fallback)", {"step": 3, "total_steps": 4})
+                        return {"error": f"Editing failed on Groq. Error: {str(groq_e)}"}
+            elif self.gemini_model:
+                self.log("Attempting Gemini model for EditorAgent")
+                response = self.gemini_model.generate_content(
+                    prompt,
+                    generation_config=genai.GenerationConfig(
+                        response_mime_type="application/json",
+                    )
+                )
+                raw_json = response.text
+                self.log("Received response from Gemini EditorAgent")
+                parsed_response = json.loads(raw_json)
             else:
-                await self._emit_status("error", "Failed to generate changes", {"step": 3, "total_steps": 4})
-                return {"error": f"Editing failed: {str(e)}"}
+                 await self._emit_status("error", "Failed to generate changes, no LLM configured.", {"step": 3, "total_steps": 4})
+                 return {"error": "No LLM clients available."}
+
+        except Exception as e:
+            self.log(f"Editing generation failed: {str(e)}")
+            await self._emit_status("error", "Failed to generate changes", {"step": 3, "total_steps": 4})
+            return {"error": f"Editing failed: {str(e)}"}
         
         # Step 4: Apply changes
         changes = parsed_response.get("changes", [])

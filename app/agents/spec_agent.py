@@ -14,14 +14,16 @@ class SpecificationAgent(BaseAgent):
     """Agent responsible for converting raw requirements into structured JSON specifications."""
     
     def __init__(self):
-        # We use a model that handles JSON reliably.
-        self.gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-        
-        # Groq Fallback Client
+        # Always use Groq client first, fallback currently acts as the primary
         self.groq_client = None
         if settings.GROQ_API_KEY:
             self.groq_client = Groq(api_key=settings.GROQ_API_KEY)
             self.groq_model = settings.GROQ_LLM_MODEL
+
+        # We use a model that handles JSON reliably.
+        self.gemini_model = None
+        if settings.GEMINI_API_KEY:
+            self.gemini_model = genai.GenerativeModel("gemini-1.5-flash")
     
     async def generate_specification(self, requirement: Requirement) -> Dict[str, Any]:
         self.log(f"Generating specification for requirement {requirement.id}")
@@ -47,20 +49,8 @@ class SpecificationAgent(BaseAgent):
         """
         
         try:
-            self.log("Attempting Gemini model")
-            response = self.gemini_model.generate_content(
-                prompt,
-                generation_config=genai.GenerationConfig(
-                    response_mime_type="application/json",
-                )
-            )
-            raw_json = response.text
-            self.log("Received response from Gemini")
-            return json.loads(raw_json)
-        except Exception as e:
-            self.log(f"Gemini generation failed: {str(e)}")
             if self.groq_client:
-                self.log(f"Falling back to Groq model {self.groq_model}")
+                self.log(f"Attempting Groq model {self.groq_model}")
                 try:
                     chat_completion = self.groq_client.chat.completions.create(
                         messages=[
@@ -73,7 +63,30 @@ class SpecificationAgent(BaseAgent):
                     self.log("Received response from Groq")
                     return json.loads(raw_json)
                 except Exception as groq_e:
-                    self.log(f"Groq fallback failed: {str(groq_e)}")
-                    raise Exception(f"Both Gemini and Groq generation failed. Gemini: {e}, Groq: {groq_e}")
+                    self.log(f"Groq failed: {str(groq_e)}")
+                    if self.gemini_model:
+                        self.log("Falling back to Gemini...")
+                        response = self.gemini_model.generate_content(
+                            prompt,
+                            generation_config=genai.GenerationConfig(
+                                response_mime_type="application/json",
+                            )
+                        )
+                        return json.loads(response.text)
+                    raise Exception(f"Groq generation failed and no Gemini fallback. Error: {groq_e}")
+            elif self.gemini_model:
+                self.log("Attempting Gemini model")
+                response = self.gemini_model.generate_content(
+                    prompt,
+                    generation_config=genai.GenerationConfig(
+                        response_mime_type="application/json",
+                    )
+                )
+                raw_json = response.text
+                self.log("Received response from Gemini")
+                return json.loads(raw_json)
             else:
-                raise e
+                raise Exception("No LLM clients available.")
+        except Exception as e:
+            self.log(f"Generation failed: {str(e)}")
+            raise e

@@ -1,13 +1,108 @@
+import json
+
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import delete
 import uuid
 
-from app.models.project import Project
+from app.models.project import Integration, IntegrationStatus, IntegrationType, Project, ProjectStatus
 from app.schemas.project import ProjectCreate, ProjectUpdate
+from app.utils.paths import get_project_dir
 
 class ProjectService:
+    IGNORED_STORAGE_DIRS = {".git", "node_modules", "dist", "build", "__pycache__", ".pytest_cache"}
+
+    @staticmethod
+    def _project_storage_bytes(project_id: str | uuid.UUID) -> int:
+        project_dir = get_project_dir(str(project_id))
+        if not project_dir.exists() or not project_dir.is_dir():
+            return 0
+
+        total = 0
+        for path in project_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                rel = path.relative_to(project_dir).as_posix()
+            except ValueError:
+                continue
+            if any(part in ProjectService.IGNORED_STORAGE_DIRS for part in rel.split("/")):
+                continue
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    @staticmethod
+    def _decode_integration_payload(integration: Integration | None) -> dict:
+        if not integration or not integration.encrypted_credentials:
+            return {}
+
+        try:
+            parsed = json.loads(integration.encrypted_credentials)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+    @staticmethod
+    def _serialize_project(
+        project: Project,
+        vercel: Integration | None = None,
+        supabase: Integration | None = None,
+    ) -> dict:
+        payload = ProjectService._decode_integration_payload(vercel)
+
+        production_url = payload.get("production_url")
+        preview_url = payload.get("preview_url")
+        vercel_url = production_url or preview_url
+        is_live = (
+            vercel is not None
+            and vercel.status == IntegrationStatus.connected
+            and isinstance(vercel_url, str)
+            and bool(vercel_url.strip())
+        )
+        supabase_connected = (
+            supabase is not None
+            and supabase.status == IntegrationStatus.connected
+        )
+
+        return {
+            "id": project.id,
+            "user_id": project.user_id,
+            "name": project.name,
+            "slug": project.slug,
+            "status": ProjectStatus.deployed if is_live else project.status,
+            "thumbnail_url": project.thumbnail_url,
+            "created_at": project.created_at,
+            "updated_at": project.updated_at,
+            "storage_bytes": ProjectService._project_storage_bytes(project.id),
+            "vercel_url": vercel_url if isinstance(vercel_url, str) else None,
+            "vercel_preview_url": preview_url if isinstance(preview_url, str) else None,
+            "vercel_production_url": production_url if isinstance(production_url, str) else None,
+            "is_live": is_live,
+            "supabase_connected": supabase_connected,
+        }
+
+    @staticmethod
+    async def get_project_response(db: AsyncSession, project_id: str, user_id: str) -> dict:
+        project = await ProjectService.get_project(db, project_id, user_id)
+        integrations_result = await db.execute(
+            select(Integration).where(
+                Integration.project_id == project.id,
+                Integration.type.in_([IntegrationType.vercel, IntegrationType.supabase]),
+            )
+        )
+        integrations = {
+            integration.type: integration
+            for integration in integrations_result.scalars().all()
+        }
+        return ProjectService._serialize_project(
+            project,
+            integrations.get(IntegrationType.vercel),
+            integrations.get(IntegrationType.supabase),
+        )
+
     @staticmethod
     async def get_projects(db: AsyncSession, user_id: str):
         result = await db.execute(
@@ -15,7 +110,29 @@ class ProjectService:
             .where(Project.user_id == user_id)
             .order_by(Project.created_at.desc())
         )
-        return result.scalars().all()
+        projects = result.scalars().all()
+        if not projects:
+            return []
+
+        project_ids = [project.id for project in projects]
+        integrations_result = await db.execute(
+            select(Integration).where(
+                Integration.project_id.in_(project_ids),
+                Integration.type.in_([IntegrationType.vercel, IntegrationType.supabase]),
+            )
+        )
+        integrations_by_project_id = {}
+        for integration in integrations_result.scalars().all():
+            integrations_by_project_id.setdefault(integration.project_id, {})[integration.type] = integration
+
+        return [
+            ProjectService._serialize_project(
+                project,
+                integrations_by_project_id.get(project.id, {}).get(IntegrationType.vercel),
+                integrations_by_project_id.get(project.id, {}).get(IntegrationType.supabase),
+            )
+            for project in projects
+        ]
 
     @staticmethod
     async def get_project(db: AsyncSession, project_id: str, user_id: str) -> Project:

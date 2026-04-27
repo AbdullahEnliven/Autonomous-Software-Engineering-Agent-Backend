@@ -223,7 +223,7 @@ async def get_project(
     current_user: User = Depends(get_current_user)
 ):
     """Get project details."""
-    return await ProjectService.get_project(db, project_id, current_user.id)
+    return await ProjectService.get_project_response(db, project_id, current_user.id)
 
 @router.patch("/{project_id}", response_model=ProjectResponse)
 async def update_project(

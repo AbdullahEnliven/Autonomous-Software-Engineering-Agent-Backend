@@ -24,6 +24,12 @@ class ProjectResponse(BaseModel):
     thumbnail_url: Optional[str]
     created_at: datetime
     updated_at: datetime
+    storage_bytes: int = 0
+    vercel_url: Optional[str] = None
+    vercel_preview_url: Optional[str] = None
+    vercel_production_url: Optional[str] = None
+    is_live: bool = False
+    supabase_connected: bool = False
     
     class Config:
         from_attributes = True

@@ -10,9 +10,10 @@ from datetime import datetime
 
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
 
 from app.config import settings
-from app.models.project import Integration, IntegrationStatus, IntegrationType
+from app.models.project import Integration, IntegrationStatus, IntegrationType, Project, ProjectStatus
 from app.services.integration_service import IntegrationService
 from app.services.project_service import ProjectService
 from app.socketio.server import sio
@@ -351,6 +352,11 @@ class DeploymentService:
             integration.encrypted_credentials = json.dumps(current_payload)
             integration.status = IntegrationStatus.connected
             integration.connected_at = datetime.utcnow()
+
+        project_result = await db.execute(select(Project).where(Project.id == project_id))
+        project = project_result.scalars().first()
+        if project:
+            project.status = ProjectStatus.deployed
 
         await db.commit()
         return url

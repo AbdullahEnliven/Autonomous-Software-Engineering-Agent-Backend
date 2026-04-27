@@ -9,7 +9,7 @@ import zipfile
 
 from app.database import get_db, async_session_maker
 from app.models.user import User
-from app.models.project import Project, Specification, GenerationJobStatus
+from app.models.project import Specification, GenerationJobStatus
 from app.dependencies import get_current_user
 from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse
 from app.schemas.requirement import RequirementCreate
@@ -21,7 +21,6 @@ from app.services.chat_service import ChatService
 from app.services.version_control_service import VersionControlService
 from app.services.name_selector_service import NameSelectorService
 from app.services.preview_manager import PreviewManager
-from app.services.thumbnail_service import ThumbnailService
 from app.utils.paths import get_project_dir
 from pydantic import BaseModel
 from sqlalchemy.future import select
@@ -134,38 +133,6 @@ async def create_project(
         "project": project,
         "spec": spec
     }
-
-
-@router.post("/thumbnails/generate", response_model=List[ProjectResponse])
-async def generate_project_thumbnails(
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Generate or backfill thumbnail files for all projects owned by the current user."""
-    return await ProjectService.generate_project_thumbnails(db, current_user.id)
-
-
-@router.get("/{project_id}/thumbnail")
-async def get_project_thumbnail(
-    project_id: str,
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(select(Project).where(Project.id == project_id))
-    project = result.scalars().first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    path = ThumbnailService.existing_thumbnail_path(project_id)
-    if not path:
-        path = await ThumbnailService.ensure_thumbnail(db, project)
-        await db.commit()
-
-    media_type = "image/png" if path.suffix.lower() == ".png" else "image/svg+xml"
-    return FileResponse(
-        path=str(path),
-        media_type=media_type,
-        headers={"Cache-Control": "no-cache"},
-    )
 
 
 @router.get("/{project_id}/chat-history")

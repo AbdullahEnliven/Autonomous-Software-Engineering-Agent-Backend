@@ -10,9 +10,12 @@ from app.schemas.auth import (
     UserLogin,
     GithubOAuthUrlResponse,
     GithubOAuthCallbackRequest,
+    ChangePasswordRequest,
 )
 from app.services.auth_service import AuthService
 from app.dependencies import get_current_user
+from app.models.user import User
+from app.utils.security import get_password_hash, verify_password
 
 router = APIRouter()
 
@@ -121,3 +124,27 @@ async def github_oauth_callback(
         "user": user,
         "token": access_token,
     }
+
+
+@router.post("/change-password")
+async def change_password(
+    payload: ChangePasswordRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not verify_password(payload.currentPassword, current_user.hashed_password):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
+
+    current_user.hashed_password = get_password_hash(payload.newPassword)
+    await db.commit()
+    return {"message": "Password changed successfully"}
+
+
+@router.delete("/account", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_account(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await db.delete(current_user)
+    await db.commit()
+    return None

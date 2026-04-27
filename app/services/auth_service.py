@@ -193,7 +193,19 @@ class AuthService:
         db_user = User(
             email=normalized_email,
             hashed_password=hashed_password,
-            full_name=user_in.full_name
+            full_name=user_in.full_name,
+            company_name=user_in.company_name,
+            role=user_in.role,
+            phone=user_in.phone,
+            website=user_in.website,
+            country=user_in.country,
+            industry=user_in.industry,
+            company_size=user_in.company_size,
+            primary_goal=user_in.primary_goal,
+            store_stage=user_in.store_stage,
+            monthly_revenue=user_in.monthly_revenue,
+            referral_source=user_in.referral_source,
+            onboarding_completed=True,
         )
         
         db.add(db_user)

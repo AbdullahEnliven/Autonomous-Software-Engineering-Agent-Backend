@@ -16,6 +16,7 @@ from app.config import settings
 from app.models.project import Integration, IntegrationStatus, IntegrationType, Project, ProjectStatus
 from app.services.integration_service import IntegrationService
 from app.services.project_service import ProjectService
+from app.services.thumbnail_service import ThumbnailService
 from app.socketio.server import sio
 from app.utils.paths import get_project_dir
 
@@ -357,6 +358,7 @@ class DeploymentService:
         project = project_result.scalars().first()
         if project:
             project.status = ProjectStatus.deployed
+            await ThumbnailService.ensure_thumbnail(db, project, url, refresh=True)
 
         await db.commit()
         return url

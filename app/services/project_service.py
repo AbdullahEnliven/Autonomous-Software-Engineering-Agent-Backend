@@ -7,6 +7,7 @@ import uuid
 
 from app.models.project import Integration, IntegrationStatus, IntegrationType, Project, ProjectStatus
 from app.schemas.project import ProjectCreate, ProjectUpdate
+from app.services.thumbnail_service import ThumbnailService
 from app.utils.paths import get_project_dir
 
 class ProjectService:
@@ -125,6 +126,14 @@ class ProjectService:
         for integration in integrations_result.scalars().all():
             integrations_by_project_id.setdefault(integration.project_id, {})[integration.type] = integration
 
+        thumbnail_changed = False
+        for project in projects:
+            thumbnail_changed = ThumbnailService.ensure_thumbnail_url(project) or thumbnail_changed
+            if not ThumbnailService.existing_thumbnail_path(str(project.id)):
+                ThumbnailService._write_placeholder(project)
+        if thumbnail_changed:
+            await db.commit()
+
         return [
             ProjectService._serialize_project(
                 project,
@@ -157,7 +166,40 @@ class ProjectService:
         db.add(db_project)
         await db.commit()
         await db.refresh(db_project)
+        ThumbnailService.ensure_thumbnail_url(db_project)
+        ThumbnailService._write_placeholder(db_project)
+        await db.commit()
+        await db.refresh(db_project)
         return db_project
+
+    @staticmethod
+    async def generate_project_thumbnails(db: AsyncSession, user_id: str):
+        result = await db.execute(
+            select(Project)
+            .where(Project.user_id == user_id)
+            .order_by(Project.created_at.desc())
+        )
+        projects = result.scalars().all()
+        if not projects:
+            return []
+
+        project_ids = [project.id for project in projects]
+        integrations_result = await db.execute(
+            select(Integration).where(
+                Integration.project_id.in_(project_ids),
+                Integration.type == IntegrationType.vercel,
+                Integration.status == IntegrationStatus.connected,
+            )
+        )
+        source_urls_by_project_id = {}
+        for integration in integrations_result.scalars().all():
+            payload = ProjectService._decode_integration_payload(integration)
+            source_url = payload.get("production_url") or payload.get("preview_url")
+            if isinstance(source_url, str) and source_url.strip():
+                source_urls_by_project_id[integration.project_id] = source_url.strip()
+
+        await ThumbnailService.generate_for_projects(db, projects, source_urls_by_project_id)
+        return await ProjectService.get_projects(db, user_id)
 
     @staticmethod
     async def update_project(db: AsyncSession, project_id: str, user_id: str, project_in: ProjectUpdate) -> Project:

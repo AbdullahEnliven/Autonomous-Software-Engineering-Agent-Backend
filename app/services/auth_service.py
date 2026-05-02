@@ -259,3 +259,50 @@ class AuthService:
         refresh_token = create_refresh_token(subject=user.id)
         
         return access_token, refresh_token
+
+    @staticmethod
+    async def process_forgot_password(db: AsyncSession, email: str):
+        normalized_email = AuthService._normalize_email(email)
+        result = await db.execute(select(User).where(User.email == normalized_email))
+        user = result.scalars().first()
+        
+        if user and user.is_active:
+            from app.utils.security import create_reset_password_token
+            from app.services.email_service import EmailService
+            import asyncio
+            token = create_reset_password_token(user.email)
+            asyncio.create_task(EmailService.send_reset_password_email(user.email, token))
+
+    @staticmethod
+    async def process_reset_password(db: AsyncSession, token: str, new_password: str):
+        from app.utils.security import decode_token, get_password_hash
+        payload = decode_token(token)
+        if not payload or payload.get("type") != "reset_password":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset token")
+            
+        email = payload.get("sub")
+        result = await db.execute(select(User).where(User.email == email))
+        user = result.scalars().first()
+        
+        if not user or not user.is_active:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User not found or inactive")
+            
+        user.hashed_password = get_password_hash(new_password)
+        await db.commit()
+
+    @staticmethod
+    async def process_verify_email(db: AsyncSession, token: str):
+        from app.utils.security import decode_token
+        payload = decode_token(token)
+        if not payload or payload.get("type") != "verify_email":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired verification token")
+            
+        email = payload.get("sub")
+        result = await db.execute(select(User).where(User.email == email))
+        user = result.scalars().first()
+        
+        if not user:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User not found")
+            
+        user.is_verified = True
+        await db.commit()

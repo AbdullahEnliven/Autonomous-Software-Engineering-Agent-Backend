@@ -83,3 +83,13 @@ class UserUpdate(BaseModel):
 class ChangePasswordRequest(BaseModel):
     currentPassword: str = Field(min_length=1)
     newPassword: str = Field(min_length=8)
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    newPassword: str = Field(min_length=8)
+
+class VerifyEmailRequest(BaseModel):
+    token: str

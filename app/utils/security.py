@@ -35,3 +35,20 @@ def create_refresh_token(subject: Union[str, Any], expires_delta: timedelta = No
     to_encode = {"exp": expire, "sub": str(subject), "type": "refresh"}
     encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
+def create_verification_token(email: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(days=1)
+    to_encode = {"exp": expire, "sub": email, "type": "verify_email"}
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=ALGORITHM)
+
+def create_reset_password_token(email: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(hours=1)
+    to_encode = {"exp": expire, "sub": email, "type": "reset_password"}
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=ALGORITHM)
+
+def decode_token(token: str) -> dict:
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except Exception:
+        return None

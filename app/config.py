@@ -33,11 +33,14 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: str = "your-google-client-id"
     GOOGLE_CLIENT_SECRET: str = "your-google-client-secret"
     
-    # Email
-    RESEND_API_KEY: str = "your-resend-key"
+    # Email & SMTP Settings
+    RESEND_API_KEY: str = ""
     EMAIL_FROM: str = "noreply@asea.app"
-    
-    # Storage
+    SMTP_SERVER: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    CONTACT_EMAIL: str = "" # Email address to receive contact form submissions
     STORAGE_PATH: str = "/tmp/asea/projects"
     ARTIFACT_PATH: str = "/tmp/asea/artifacts"
     USER_PROJECTS_DIR: str = ""

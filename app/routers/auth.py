@@ -11,8 +11,12 @@ from app.schemas.auth import (
     GithubOAuthUrlResponse,
     GithubOAuthCallbackRequest,
     ChangePasswordRequest,
+    ForgotPasswordRequest,
+    ResetPasswordRequest,
+    VerifyEmailRequest,
 )
 from app.services.auth_service import AuthService
+from app.services.email_service import EmailService
 from app.dependencies import get_current_user
 from app.models.user import User
 from app.utils.security import get_password_hash, verify_password
@@ -28,6 +32,12 @@ async def register(user_in: UserCreate, db: AsyncSession = Depends(get_db)):
     access_token, refresh_token = await AuthService.authenticate_user(
         db, UserLogin(email=user_in.email, password=user_in.password)
     )
+    
+    import asyncio
+    from app.utils.security import create_verification_token
+    token = create_verification_token(user.email)
+    asyncio.create_task(EmailService.send_welcome_email(user.email, user.full_name))
+    asyncio.create_task(EmailService.send_verification_email(user.email, token))
     
     return {
         "user": user,
@@ -148,3 +158,28 @@ async def delete_account(
     await db.delete(current_user)
     await db.commit()
     return None
+
+@router.post("/forgot-password")
+async def forgot_password(
+    payload: ForgotPasswordRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    await AuthService.process_forgot_password(db, payload.email)
+    # Always return success to prevent email enumeration
+    return {"message": "If that email exists, a reset link has been sent."}
+
+@router.post("/reset-password")
+async def reset_password(
+    payload: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    await AuthService.process_reset_password(db, payload.token, payload.newPassword)
+    return {"message": "Password reset successfully"}
+
+@router.post("/verify-email")
+async def verify_email(
+    payload: VerifyEmailRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    await AuthService.process_verify_email(db, payload.token)
+    return {"message": "Email verified successfully"}

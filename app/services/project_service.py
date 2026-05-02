@@ -11,6 +11,8 @@ from app.utils.paths import get_project_dir
 
 class ProjectService:
     IGNORED_STORAGE_DIRS = {".git", "node_modules", "dist", "build", "__pycache__", ".pytest_cache"}
+    # Beta plan: hard cap on projects per user
+    BETA_PROJECT_LIMIT = 5
 
     @staticmethod
     def _project_storage_bytes(project_id: str | uuid.UUID) -> int:
@@ -144,6 +146,18 @@ class ProjectService:
 
     @staticmethod
     async def create_project(db: AsyncSession, project_in: ProjectCreate, user_id: str) -> Project:
+        # Enforce beta plan limit
+        count_result = await db.execute(select(Project).where(Project.user_id == user_id))
+        existing_count = len(count_result.scalars().all())
+        if existing_count >= ProjectService.BETA_PROJECT_LIMIT:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Beta plan limit reached. You can create up to {ProjectService.BETA_PROJECT_LIMIT} projects. "
+                    f"You currently have {existing_count} project(s)."
+                ),
+            )
+
         # Generate a simple slug
         project_name = project_in.storeName or "Untitled Store"
         base_slug = project_name.lower().replace(" ", "-")

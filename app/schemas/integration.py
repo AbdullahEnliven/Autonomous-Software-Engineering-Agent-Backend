@@ -58,6 +58,11 @@ class GithubStatusResponse(BaseModel):
     connected: bool
     username: str | None = None
     connected_at: str | None = None
+    repo: str | None = None
+    url: str | None = None
+    branch: str | None = None
+    last_push_at: str | None = None
+    last_commit_hash: str | None = None
 
 
 class GithubOrg(BaseModel):
@@ -85,6 +90,8 @@ class GithubPushResponse(BaseModel):
     created: bool
     committed_files: int
     skipped_files: int
+    commits_pushed: int | None = None
+    head_commit: str | None = None
 
 
 class DeployRequest(BaseModel):

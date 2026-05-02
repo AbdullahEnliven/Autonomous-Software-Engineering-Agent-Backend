@@ -6,6 +6,7 @@ from pathlib import Path
 import hashlib
 import tempfile
 import zipfile
+import time
 
 from app.database import get_db, async_session_maker
 from app.models.user import User
@@ -19,6 +20,7 @@ from app.services.specification_service import SpecificationService
 from app.services.generation_service import GenerationService
 from app.services.chat_service import ChatService
 from app.services.version_control_service import VersionControlService
+from app.services.integration_service import IntegrationService
 from app.services.name_selector_service import NameSelectorService
 from app.services.preview_manager import PreviewManager
 from app.utils.paths import get_project_dir
@@ -206,6 +208,14 @@ async def restore_project_checkpoint(
 ):
     await ProjectService.get_project(db, project_id, current_user.id)
     checkpoint = await VersionControlService.restore_checkpoint(db, project_id, checkpoint_id)
+    await PreviewManager.restart_preview(project_id)
+
+    github_push = {"pushed": False, "reason": "repo_not_configured"}
+    try:
+        github_push = await IntegrationService.auto_push_connected_repo(db, project_id, str(current_user.id))
+    except HTTPException as exc:
+        github_push = {"pushed": False, "error": str(exc.detail)}
+
     return {
         "status": "ok",
         "restored_checkpoint": {
@@ -214,6 +224,7 @@ async def restore_project_checkpoint(
             "commit_hash": checkpoint.commit_hash,
             "created_at": checkpoint.created_at,
         },
+        "github_push": github_push,
     }
 
 @router.get("/{project_id}", response_model=ProjectResponse)
@@ -426,6 +437,7 @@ async def get_project_preview(project_id: str, page: str, current_user: User = D
         """)
 
     page_path = "" if page == "home" else page.lower()
-    return HTMLResponse(content=f"""<style>body {{ margin: 0; padding: 0; overflow: hidden; }} iframe {{ width: 100vw; height: 100vh; border: none; }}</style><iframe src="http://localhost:{port}/{page_path}"></iframe>""")
+    cache_buster = int(time.time() * 1000)
+    return HTMLResponse(content=f"""<style>body {{ margin: 0; padding: 0; overflow: hidden; }} iframe {{ width: 100vw; height: 100vh; border: none; }}</style><iframe src="http://localhost:{port}/{page_path}?_asea_v={cache_buster}"></iframe>""")
 
 

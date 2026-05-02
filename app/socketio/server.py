@@ -12,6 +12,7 @@ from app.models.project import Project
 from app.services.preview_manager import PreviewManager
 from app.services.chat_service import ChatService
 from app.services.version_control_service import VersionControlService
+from app.services.integration_service import IntegrationService
 from app.agents.editor_agent import EditorAgent
 from app.utils.security import ALGORITHM
 
@@ -163,27 +164,53 @@ async def handle_chat_message(sid, data):
         
     print(f"Received chat from {sid} for project {project_id}: {message}")
 
-    # Each chat message becomes a git checkpoint (best effort).
-    checkpoint_message = f"Chat checkpoint: {message.strip()[:120]}"
+    client_message_id = data.get("client_message_id")
+    pre_edit_checkpoint = None
+
+    # Each user prompt gets a restore point, but it should not create an extra Git commit.
+    checkpoint_message = f"Before chat edit: {message.strip()[:120]}"
     try:
         async with async_session_maker() as db:
-            await VersionControlService.create_checkpoint(db, project_id, checkpoint_message)
+            pre_edit_checkpoint = await VersionControlService.record_current_checkpoint(db, project_id, checkpoint_message)
     except Exception as exc:
         print(f"Failed to create chat checkpoint: {exc}")
 
     # Save user message to persistent chat history.
     try:
         async with async_session_maker() as db:
-            await ChatService.create_message(
+            user_metadata = {
+                "sid": sid,
+                "user_id": user_id,
+                "received_at": int(time.time()),
+                "client_message_id": client_message_id,
+            }
+            if pre_edit_checkpoint:
+                user_metadata.update(
+                    {
+                        "checkpoint_id": str(pre_edit_checkpoint.id),
+                        "commit_hash": pre_edit_checkpoint.commit_hash,
+                        "checkpoint_message": pre_edit_checkpoint.message,
+                    }
+                )
+
+            persisted_user = await ChatService.create_message(
                 db,
                 project_id,
                 "user",
                 message,
+                user_metadata,
+            )
+            await sio.emit(
+                "chat_message_saved",
                 {
-                    "sid": sid,
-                    "user_id": user_id,
-                    "received_at": int(time.time()),
+                    "project_id": project_id,
+                    "id": str(persisted_user.id),
+                    "client_message_id": client_message_id,
+                    "role": "user",
+                    "message": message,
+                    "metadata": user_metadata,
                 },
+                room=project_id,
             )
     except Exception as exc:
         print(f"Failed to persist user chat message: {exc}")
@@ -204,12 +231,24 @@ async def handle_chat_message(sid, data):
         # Notify room the agent is thinking.
         await sio.emit("agent_typing", {"project_id": project_id}, room=project_id)
 
+        # Fetch recent chat history for LLM context.
+        recent_history = []
+        try:
+            async with async_session_maker() as db:
+                all_msgs = await ChatService.get_messages(db, project_id)
+                recent_history = [
+                    {"role": m.role, "content": m.content}
+                    for m in (all_msgs[-6:] if len(all_msgs) > 6 else all_msgs)
+                ]
+        except Exception as exc:
+            print(f"Failed to load chat history for agent context: {exc}")
+
         # Run the agent with Socket.IO access for real-time status events.
         agent = EditorAgent()
         agent.sio = sio
         agent.sid = sid
-        result = await agent.execute_edit(project_id, message)
-    
+        result = await agent.execute_edit(project_id, message, chat_history=recent_history)
+
         if "error" in result:
             error_message = f"Sorry, I encountered an error: {result['error']}"
             persisted = None
@@ -230,36 +269,79 @@ async def handle_chat_message(sid, data):
             return
 
         agent_reply = result.get("reply", "I've updated the code for you.")
+        post_edit_checkpoint = None
+        github_push = {"pushed": False, "reason": "repo_not_configured"}
+
+        try:
+            async with async_session_maker() as db:
+                post_edit_checkpoint = await VersionControlService.create_checkpoint(
+                    db,
+                    project_id,
+                    f"Chat response: {message.strip()[:100]}",
+                )
+                if user_id:
+                    try:
+                        github_push = await IntegrationService.auto_push_connected_repo(db, project_id, user_id)
+                    except Exception as exc:
+                        detail = getattr(exc, "detail", str(exc))
+                        github_push = {"pushed": False, "error": str(detail)}
+                        print(f"Failed to auto-push chat checkpoint: {detail}")
+                else:
+                    github_push = {"pushed": False, "reason": "socket_not_authenticated"}
+        except Exception as exc:
+            github_push = {"pushed": False, "error": str(exc)}
+            print(f"Failed to create post-edit chat checkpoint: {exc}")
+
         persisted = None
         try:
             async with async_session_maker() as db:
+                agent_metadata = {
+                    "files_modified": result.get("files_modified", []),
+                    "plan": result.get("plan", ""),
+                    "github_push": github_push,
+                }
+                if post_edit_checkpoint:
+                    agent_metadata.update(
+                        {
+                            "checkpoint_id": str(post_edit_checkpoint.id),
+                            "commit_hash": post_edit_checkpoint.commit_hash,
+                            "checkpoint_message": post_edit_checkpoint.message,
+                        }
+                    )
+
                 persisted = await ChatService.create_message(
                     db,
                     project_id,
                     "agent",
                     agent_reply,
-                    {
-                        "files_modified": result.get("files_modified", []),
-                        "plan": result.get("plan", ""),
-                    },
+                    agent_metadata,
                 )
         except Exception as exc:
             print(f"Failed to persist agent reply: {exc}")
 
-        await PreviewManager.touch_project(project_id)
+        await PreviewManager.restart_preview(project_id)
         await sio.emit("agent_reply", {
             "project_id": project_id,
             "id": str(persisted.id) if persisted else None,
             "role": "agent",
             "message": agent_reply,
             "files_modified": result.get("files_modified", []),
-            "plan": result.get("plan", "")
+            "plan": result.get("plan", ""),
+            "checkpoint_id": str(post_edit_checkpoint.id) if post_edit_checkpoint else None,
+            "commit_hash": post_edit_checkpoint.commit_hash if post_edit_checkpoint else None,
+            "github_push": github_push,
         }, room=project_id)
 
         # Notify clients to trigger preview refresh UX; Vite HMR still handles direct code pushes.
         await sio.emit(
             "code_updated",
-            {"project_id": project_id, "updated_at": int(time.time() * 1000)},
+            {
+                "project_id": project_id,
+                "updated_at": int(time.time() * 1000),
+                "checkpoint_id": str(post_edit_checkpoint.id) if post_edit_checkpoint else None,
+                "commit_hash": post_edit_checkpoint.commit_hash if post_edit_checkpoint else None,
+                "github_push": github_push,
+            },
             room=project_id,
         )
 

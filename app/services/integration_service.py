@@ -1,8 +1,10 @@
 import json
 import base64
 import asyncio
+import subprocess
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 from fastapi import HTTPException, status
@@ -15,6 +17,7 @@ from app.models.user import GithubConnection
 from app.config import settings
 from app.schemas.integration import SupabaseCredentials
 from app.services.project_service import ProjectService
+from app.services.version_control_service import VersionControlService
 from app.utils.paths import get_project_dir
 
 
@@ -71,6 +74,124 @@ class IntegrationService:
                 continue
             files.append(path)
         return files
+
+    @staticmethod
+    def _decode_integration_payload(integration: Integration | None) -> dict:
+        if not integration or not integration.encrypted_credentials:
+            return {}
+
+        try:
+            parsed = json.loads(integration.encrypted_credentials)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+    @staticmethod
+    def _sanitize_secret(value: str, secrets: list[str]) -> str:
+        sanitized = value
+        for secret in secrets:
+            if not secret:
+                continue
+            sanitized = sanitized.replace(secret, "***")
+            sanitized = sanitized.replace(quote(secret, safe=""), "***")
+        return sanitized
+
+    @staticmethod
+    def _run_git_push(args: list[str], cwd: Path, secrets: list[str]) -> str:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return (result.stdout or "").strip()
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=500, detail="Git is not installed on the server") from exc
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or exc.stdout or "Git push failed").strip()
+            stderr = IntegrationService._sanitize_secret(stderr, secrets)
+            raise HTTPException(status_code=400, detail=f"GitHub push failed: {stderr}") from exc
+
+    @staticmethod
+    def _get_or_create_github_repo(
+        *,
+        access_token: str,
+        repo_name: str,
+        owner: str | None,
+        is_private: bool,
+    ):
+        gh = Github(access_token)
+        user = gh.get_user()
+        target_owner = owner.strip() if owner else user.login
+
+        if target_owner.lower() == user.login.lower():
+            namespace = user
+        else:
+            namespace = gh.get_organization(target_owner)
+
+        created = False
+        full_repo_name = f"{target_owner}/{repo_name}"
+        try:
+            repo = gh.get_repo(full_repo_name)
+        except GithubException as exc:
+            if exc.status != 404:
+                raise
+            repo = namespace.create_repo(name=repo_name, private=is_private, auto_init=False)
+            created = True
+
+        return repo, target_owner, created
+
+    @staticmethod
+    def _push_git_history(
+        *,
+        access_token: str,
+        repo_name: str,
+        owner: str | None,
+        is_private: bool,
+        branch: str,
+        project_dir: Path,
+    ) -> dict:
+        VersionControlService._ensure_repo(str(project_dir))
+
+        target_branch = (branch or "main").strip() or "main"
+        repo, target_owner, created = IntegrationService._get_or_create_github_repo(
+            access_token=access_token,
+            repo_name=repo_name,
+            owner=owner,
+            is_private=is_private,
+        )
+
+        head_commit = VersionControlService._run_git(["rev-parse", "HEAD"], cwd=str(project_dir))
+        commit_count_raw = VersionControlService._run_git(["rev-list", "--count", "HEAD"], cwd=str(project_dir))
+        tracked_files_raw = VersionControlService._run_git(["ls-files"], cwd=str(project_dir))
+        tracked_files = [line for line in tracked_files_raw.splitlines() if line.strip()]
+
+        encoded_token = quote(access_token, safe="")
+        remote_url = f"https://x-access-token:{encoded_token}@github.com/{target_owner}/{repo.name}.git"
+        IntegrationService._run_git_push(
+            ["push", remote_url, f"HEAD:refs/heads/{target_branch}"],
+            cwd=project_dir,
+            secrets=[access_token, encoded_token],
+        )
+
+        try:
+            repo.edit(default_branch=target_branch)
+        except GithubException:
+            pass
+
+        return {
+            "url": repo.html_url,
+            "owner": target_owner,
+            "name": repo.name,
+            "branch": target_branch,
+            "created": created,
+            "committed_files": len(tracked_files),
+            "skipped_files": 0,
+            "commits_pushed": int(commit_count_raw or 0),
+            "head_commit": head_commit,
+        }
 
     @staticmethod
     def _push_repository_contents(
@@ -428,8 +549,19 @@ class IntegrationService:
         if connection is None:
             return {"connected": False, "username": None, "connected_at": None}
 
+        integration = await IntegrationService._get_integration(db, project_id, IntegrationType.github)
+        payload = IntegrationService._decode_integration_payload(integration)
         connected_at = connection.connected_at.isoformat() if connection.connected_at else None
-        return {"connected": True, "username": connection.github_username, "connected_at": connected_at}
+        return {
+            "connected": True,
+            "username": connection.github_username,
+            "connected_at": connected_at,
+            "repo": payload.get("repo"),
+            "url": payload.get("url"),
+            "branch": payload.get("branch"),
+            "last_push_at": payload.get("last_push_at"),
+            "last_commit_hash": payload.get("last_commit_hash"),
+        }
 
     @staticmethod
     async def get_github_orgs(db: AsyncSession, project_id: str, user_id: str) -> dict:
@@ -470,15 +602,16 @@ class IntegrationService:
         if not project_dir.exists() or not project_dir.is_dir():
             raise HTTPException(status_code=404, detail="Project files not found")
 
+        checkpoint = await VersionControlService.create_checkpoint(db, project_id, commit_message)
+
         try:
             result = await asyncio.to_thread(
-                IntegrationService._push_repository_contents,
+                IntegrationService._push_git_history,
                 access_token=connection.encrypted_access_token,
                 repo_name=repo_name,
                 owner=owner,
                 is_private=is_private,
                 branch=branch,
-                commit_message=commit_message,
                 project_dir=project_dir,
             )
         except GithubException as exc:
@@ -491,6 +624,10 @@ class IntegrationService:
             "repo": f"{result['owner']}/{result['name']}",
             "url": result["url"],
             "branch": result["branch"],
+            "private": is_private,
+            "last_push_at": datetime.utcnow().isoformat(),
+            "last_commit_hash": result.get("head_commit") or checkpoint.commit_hash,
+            "last_checkpoint_id": str(checkpoint.id),
             "connected_at": datetime.utcnow().isoformat(),
         }
 
@@ -510,3 +647,57 @@ class IntegrationService:
 
         await db.commit()
         return result
+
+    @staticmethod
+    async def auto_push_connected_repo(db: AsyncSession, project_id: str, user_id: str) -> dict:
+        """Push the current local Git history to the configured GitHub repo, if one exists."""
+        await ProjectService.get_project(db, project_id, user_id)
+
+        connection = await IntegrationService._get_github_connection(db, user_id)
+        if connection is None:
+            return {"pushed": False, "reason": "github_not_connected"}
+
+        integration = await IntegrationService._get_integration(db, project_id, IntegrationType.github)
+        payload = IntegrationService._decode_integration_payload(integration)
+        repo_full_name = str(payload.get("repo") or "").strip()
+        if "/" not in repo_full_name:
+            return {"pushed": False, "reason": "repo_not_configured"}
+
+        owner, repo_name = repo_full_name.split("/", 1)
+        branch = str(payload.get("branch") or "main")
+        project_dir = get_project_dir(project_id)
+        if not project_dir.exists() or not project_dir.is_dir():
+            raise HTTPException(status_code=404, detail="Project files not found")
+
+        try:
+            result = await asyncio.to_thread(
+                IntegrationService._push_git_history,
+                access_token=connection.encrypted_access_token,
+                repo_name=repo_name,
+                owner=owner,
+                is_private=bool(payload.get("private", True)),
+                branch=branch,
+                project_dir=project_dir,
+            )
+        except GithubException as exc:
+            message = exc.data.get("message") if isinstance(exc.data, dict) else str(exc)
+            raise HTTPException(status_code=400, detail=f"GitHub push failed: {message}") from exc
+
+        payload.update(
+            {
+                "github_username": connection.github_username,
+                "repo": f"{result['owner']}/{result['name']}",
+                "url": result["url"],
+                "branch": result["branch"],
+                "last_push_at": datetime.utcnow().isoformat(),
+                "last_commit_hash": result.get("head_commit"),
+            }
+        )
+
+        if integration is not None:
+            integration.encrypted_credentials = json.dumps(payload)
+            integration.status = IntegrationStatus.connected
+            integration.connected_at = datetime.utcnow()
+            await db.commit()
+
+        return {"pushed": True, **result}

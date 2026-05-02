@@ -128,6 +128,32 @@ class PreviewManager:
                 runtime.last_touched = time.monotonic()
 
     @classmethod
+    async def restart_preview(cls, project_id: str):
+        """Restart an active project preview so Vite serves the current working tree."""
+        async with cls._lock:
+            runtime = cls._active_previews.pop(project_id, None)
+            viewers = set(runtime.viewers) if runtime else set()
+
+        if runtime and cls._is_process_alive(runtime.process):
+            print(f"[PreviewManager] Restarting Vite server for {project_id}")
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(runtime.process.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                print(f"[PreviewManager] Error stopping process for restart: {e}")
+
+        proc = await cls.start_preview(project_id)
+        async with cls._lock:
+            restarted = cls._active_previews.get(project_id)
+            if restarted:
+                restarted.viewers.update(viewers)
+                restarted.last_touched = time.monotonic()
+        return proc
+
+    @classmethod
     async def stop_preview(cls, project_id: str):
         """Stop the Vite dev server for a project."""
         async with cls._lock:

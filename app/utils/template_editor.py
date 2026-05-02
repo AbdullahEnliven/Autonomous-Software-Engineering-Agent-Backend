@@ -17,7 +17,7 @@ def _get_ignore_patterns():
         # Exclude .git, node_modules, .env files, and other unnecessary dirs
         ignored = set()
         for f in files:
-            if f in {'.git', 'node_modules', '.env', '.env.local', '.env.*.local', '.gitignore'}:
+            if f in {'.git', 'node_modules', '.env', '.env.local', '.env.*.local'}:
                 ignored.add(f)
         return ignored
     return ignore_patterns
@@ -29,6 +29,10 @@ def _init_git_repo(target_dir: str):
         subprocess.run(['git', 'init'], cwd=target_dir, check=True, capture_output=True)
         subprocess.run(['git', 'config', 'user.email', 'asea@project.local'], cwd=target_dir, check=True, capture_output=True)
         subprocess.run(['git', 'config', 'user.name', 'ASEA Project'], cwd=target_dir, check=True, capture_output=True)
+        git_exclude = os.path.join(target_dir, '.git', 'info', 'exclude')
+        os.makedirs(os.path.dirname(git_exclude), exist_ok=True)
+        with open(git_exclude, 'a', encoding='utf-8') as f:
+            f.write('\nnode_modules/\ndist/\nbuild/\n.env\n.env.*\n.vercel/\n.preview-server.json\n')
         # Initial commit
         subprocess.run(['git', 'add', '.'], cwd=target_dir, check=True, capture_output=True)
         subprocess.run(['git', 'commit', '-m', 'Initial project from template'], cwd=target_dir, check=True, capture_output=True)
@@ -292,4 +296,3 @@ def _personalize_homepage_images(target_dir: str, config: dict):
 
             with open(home_path, 'w', encoding='utf-8') as f:
                 f.write(home_content)
-

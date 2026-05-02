@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import re
+import difflib
 from typing import Dict, Any, List, Optional
 import google.generativeai as genai
 from groq import Groq
@@ -12,38 +13,43 @@ from app.utils.paths import get_project_dir
 
 genai.configure(api_key=settings.GEMINI_API_KEY)
 
+
 class EditorAgent(BaseAgent):
-    """Powerful AI code editor agent with multi-step reasoning and real-time status updates."""
-    
-    # File extensions to include when scanning
-    SCAN_EXTENSIONS = ('.jsx', '.js', '.tsx', '.ts', '.css', '.json')
-    # Directories to skip
+    """Powerful AI code editor agent using multi-step decomposition for small-context models.
+
+    Strategy: Instead of stuffing everything into one prompt (which exceeds free-tier
+    context limits), we decompose into focused steps:
+      1. PLAN  – "which files need changing?" (small prompt with file tree only)
+      2. EDIT  – one call per file with only that file's content (fits in context)
+      3. APPLY – write to disk, auto-repair if patches fail
+    """
+
+    SCAN_EXTENSIONS = ('.jsx', '.js', '.tsx', '.ts', '.css', '.json', '.html', '.mjs', '.cjs')
     SKIP_DIRS = {'node_modules', '.git', 'dist', 'build', '.next', '__pycache__'}
-    # Maximum files to include in context (ranked by relevance)
-    MAX_CONTEXT_FILES = 8
-    # Hard caps to keep prompts within model limits
-    MAX_FILE_CHARS = 3000
-    MAX_TOTAL_CONTEXT_CHARS = 15000
-    FALLBACK_MAX_CONTEXT_FILES = 4
-    FALLBACK_MAX_FILE_CHARS = 1800
-    FALLBACK_MAX_TOTAL_CONTEXT_CHARS = 7000
-    FALLBACK_FILE_TREE_LINES = 28
-    
+
+    # Per-file caps (kept small for free-tier models)
+    MAX_FILE_CHARS = 8000
+    MAX_PLAN_TREE_LINES = 120
+
     def __init__(self):
-        # Always use Groq client first, fallback currently acts as the primary
+        # --- Groq (primary) ---
         self.groq_client = None
         if settings.GROQ_API_KEY:
             self.groq_client = Groq(api_key=settings.GROQ_API_KEY)
             self.groq_model = settings.GROQ_LLM_MODEL
-            
+
+
+
+        # --- Gemini (fallback) ---
         self.gemini_model = None
         if settings.GEMINI_API_KEY:
             self.gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-        
+
         # Socket.IO references for real-time status
         self.sio = None
         self.sid = None
 
+    # ------------------------------------------------------------------ utils
     async def _emit_status(self, status_type: str, message: str, details: Optional[Dict] = None):
         """Emit real-time status update to the connected client via Socket.IO."""
         if self.sio and self.sid:
@@ -58,106 +64,24 @@ class EditorAgent(BaseAgent):
         """Scan the entire src/ directory tree for editable files."""
         files_collected = []
         src_dir = os.path.join(target_dir, "src")
-        
         if not os.path.exists(src_dir):
-            # Fallback: scan target_dir itself
             src_dir = target_dir
-        
         for root, dirs, files in os.walk(src_dir):
-            # Skip ignored directories
             dirs[:] = [d for d in dirs if d not in self.SKIP_DIRS]
             for file in files:
                 if file.endswith(self.SCAN_EXTENSIONS):
                     files_collected.append(os.path.join(root, file))
-        
         return files_collected
 
-    def _rank_files(self, files: List[str], prompt: str, target_dir: str) -> List[str]:
-        """Rank files by relevance to the user's prompt."""
-        prompt_lower = prompt.lower()
-        prompt_words = set(prompt_lower.split())
-        
-        scored_files = []
-        for fp in files:
-            score = 0
-            rel_path = os.path.relpath(fp, target_dir).lower()
-            name_lower = os.path.basename(fp).lower()
-            name_no_ext = os.path.splitext(name_lower)[0]
-            
-            # Direct file name mention in prompt
-            if name_no_ext in prompt_lower:
-                score += 20
-            
-            # Partial word matches in the relative path
-            for word in prompt_words:
-                if len(word) > 2 and word in rel_path:
-                    score += 5
-            
-            # High-priority files (layout, main, app, index, home, header)
-            priority_names = {'app', 'main', 'index', 'home', 'header', 'footer', 'layout', 'navbar', 'sidebar'}
-            if name_no_ext in priority_names:
-                score += 3
-            
-            # Pages and components get a slight boost
-            if 'pages' in rel_path or 'components' in rel_path:
-                score += 2
-            
-            # Config files
-            if name_no_ext in {'tailwind.config', 'vite.config', 'package'}:
-                score += 1
-            
-            scored_files.append((score, fp))
-        
-        # Sort by score descending
-        scored_files.sort(key=lambda x: x[0], reverse=True)
-        return [fp for _, fp in scored_files[:self.MAX_CONTEXT_FILES]]
-
-    def _read_files_context(
-        self,
-        file_paths: List[str],
-        target_dir: str,
-        max_file_chars: Optional[int] = None,
-        max_total_chars: Optional[int] = None,
-    ) -> str:
-        """Read file contents and format as context string."""
-        context = ""
-        total_chars = 0
-        per_file_cap = max_file_chars or self.MAX_FILE_CHARS
-        total_cap = max_total_chars or self.MAX_TOTAL_CONTEXT_CHARS
-
-        for file_path in file_paths:
-            if total_chars >= total_cap:
-                break
-
-            rel_path = os.path.relpath(file_path, target_dir)
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-
-                if len(content) > per_file_cap:
-                    content = content[:per_file_cap] + "\n/* ...truncated for token safety... */\n"
-
-                block = f"\n--- {rel_path} ---\n{content}\n"
-                remaining = total_cap - total_chars
-                if len(block) > remaining:
-                    block = block[:remaining]
-
-                context += block
-                total_chars += len(block)
-            except Exception as e:
-                self.log(f"Failed to read {file_path}: {e}")
-
-        return context
-
-    def _build_file_tree(self, target_dir: str, max_lines: int = 60) -> str:
-        """Build a compact file tree string for the LLM to understand project structure."""
+    def _build_file_tree(self, target_dir: str, max_lines: int = 120) -> str:
+        """Build a compact file tree string for the LLM."""
         tree_lines = []
         src_dir = os.path.join(target_dir, "src")
         if not os.path.exists(src_dir):
             src_dir = target_dir
-        
         for root, dirs, files in os.walk(src_dir):
             dirs[:] = [d for d in dirs if d not in self.SKIP_DIRS]
+            dirs.sort()
             level = os.path.relpath(root, target_dir).count(os.sep)
             indent = "  " * level
             dir_name = os.path.basename(root)
@@ -166,285 +90,401 @@ class EditorAgent(BaseAgent):
             for file in sorted(files):
                 if file.endswith(self.SCAN_EXTENSIONS):
                     tree_lines.append(f"{sub_indent}{file}")
-        
-        return "\n".join(tree_lines[:max_lines])  # Cap to prevent token overflow
+        return "\n".join(tree_lines[:max_lines])
 
-    def _build_prompt(self, user_message: str, file_tree: str, context: str) -> str:
-        return f"""
-        You are an expert AI software engineer working on a React/Vite e-commerce project.
-        The user wants to make a change to their generated frontend code.
+    def _read_single_file(self, file_path: str, max_chars: int = 0) -> str:
+        """Read a single file, truncating if needed."""
+        cap = max_chars or self.MAX_FILE_CHARS
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            if len(content) > cap:
+                head = int(cap * 0.7)
+                tail = cap - head
+                content = content[:head] + "\n/* ...truncated... */\n" + content[-tail:]
+            return content
+        except Exception as e:
+            self.log(f"Failed to read {file_path}: {e}")
+            return ""
 
-        USER REQUEST: {user_message}
+    def _format_chat_history(self, chat_history: List[Dict]) -> str:
+        """Format recent chat messages as context for the LLM."""
+        if not chat_history:
+            return ""
+        lines = []
+        for msg in chat_history[-4:]:  # Last 4 messages max
+            role = msg.get("role", "user").upper()
+            content = (msg.get("content") or msg.get("message") or "")[:300]
+            lines.append(f"[{role}]: {content}")
+        return "\n".join(lines)
 
-        PROJECT FILE TREE:
-        {file_tree}
+    # ------------------------------------------------------------------ LLM calls
+    def _call_llm(self, prompt: str, expect_json: bool = True) -> str:
+        """Call the best available LLM. Returns raw text."""
+        errors = []
 
-        RELEVANT FILE CONTENTS:
-        {context}
+        # Try Groq (primary)
+        if self.groq_client:
+            try:
+                self.log(f"Calling Groq ({self.groq_model})")
+                kwargs = {
+                    "messages": [{"role": "user", "content": prompt}],
+                    "model": self.groq_model,
+                    "temperature": 0.15,
+                }
+                if expect_json:
+                    kwargs["response_format"] = {"type": "json_object"}
+                resp = self.groq_client.chat.completions.create(**kwargs)
+                return resp.choices[0].message.content or ""
+            except Exception as e:
+                errors.append(f"Groq: {e}")
+                self.log(f"Groq failed: {e}")
 
-        INSTRUCTIONS:
-        1. Analyze the current codebase and understand the existing patterns and styles.
-        2. Plan the minimal set of changes needed to fulfill the user's request.
-        3. You can MODIFY existing files or CREATE new ones.
-        4. Prefer PATCH-style edits for existing files using exact find/replace snippets.
-        5. Do NOT rewrite whole files for small tasks (e.g., add social links in footer).
-        6. Preserve all unrelated code, structure, imports, and existing behavior.
-        7. Ensure all React components remain valid JSX.
+        # Try Gemini
+        if self.gemini_model:
+            try:
+                self.log("Calling Gemini")
+                config = {"temperature": 0.15}
+                if expect_json:
+                    config["response_mime_type"] = "application/json"
+                resp = self.gemini_model.generate_content(
+                    prompt,
+                    generation_config=genai.GenerationConfig(**config),
+                )
+                return resp.text or ""
+            except Exception as e:
+                errors.append(f"Gemini: {e}")
+                self.log(f"Gemini failed: {e}")
 
-        Return ONLY valid JSON in this exact format:
-        {{
-            "plan": "A brief description of what you decided to do and why.",
-            "agent_reply": "A friendly, concise message to the user summarizing the changes made.",
-            "changes": [
-                {{
-                    "file_path": "src/components/Footer.jsx",
-                    "action": "patch",
-                    "edits": [
-                        {{
-                            "old_text": "...exact old snippet...",
-                            "new_text": "...replacement snippet..."
-                        }}
-                    ]
-                }}
-            ],
-            "files_modified": ["src/components/Footer.jsx"]
-        }}
+        raise RuntimeError("; ".join(errors) or "No LLM clients available")
 
-        Notes:
-        - Use action "create" with "content" only for brand new files.
-        - Use action "modify" with full "content" ONLY if user explicitly asks to rewrite/rebuild entire file.
-        """
+    def _parse_json(self, raw: str) -> Dict[str, Any]:
+        """Robustly parse JSON from LLM output."""
+        if not raw or not raw.strip():
+            raise ValueError("Empty LLM response")
+        text = raw.strip()
+        # Strip markdown fences
+        fence = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+        if fence:
+            text = fence.group(1).strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end > start:
+                return json.loads(text[start:end + 1])
+            # Try finding array
+            start = text.find("[")
+            end = text.rfind("]")
+            if start != -1 and end > start:
+                return {"items": json.loads(text[start:end + 1])}
+            raise
 
-    def _build_fallback_prompt(self, user_message: str, file_tree: str, context: str) -> str:
-        return f"""
-        You are a precise React/Vite code editor.
-        User request: {user_message}
+    # ------------------------------------------------------------------ STEP 1: PLAN
+    def _build_plan_prompt(self, user_message: str, file_tree: str, chat_context: str) -> str:
+        history_block = ""
+        if chat_context:
+            history_block = f"\nRECENT CHAT HISTORY:\n{chat_context}\n"
 
-        File tree (truncated):
-        {file_tree}
+        return f"""You are an expert React/Vite code planner.
+The user wants to change their e-commerce store.{history_block}
+USER REQUEST: {user_message}
 
-        Code context (truncated):
-        {context}
+PROJECT FILE TREE:
+{file_tree}
 
-        Respond with JSON only:
-        {{
-          "plan": "short plan",
-          "agent_reply": "short summary",
-          "changes": [{{"file_path":"src/file.jsx","action":"patch","edits":[{{"old_text":"...","new_text":"..."}}]}}],
-          "files_modified": ["src/file.jsx"]
-        }}
+Respond with JSON only. List which files need to be modified, created, or deleted.
+For each file, write a short task description of what to change.
 
-        Rules:
-        - Keep edits minimal and targeted.
-        - Modify only necessary files.
-        - Preserve unrelated code; do not remove existing sections unless asked.
-        - Ensure valid JSX/JS syntax.
-        """
+{{
+  "plan": "brief overall plan",
+  "file_tasks": [
+    {{"file_path": "src/components/Header.jsx", "action": "modify", "task": "Add a search bar to the header"}},
+    {{"file_path": "src/pages/SearchPage.jsx", "action": "create", "task": "Create a new search results page"}}
+  ]
+}}
 
-    def _is_full_rewrite_requested(self, user_message: str) -> bool:
-        msg = (user_message or "").lower()
-        rewrite_keywords = [
-            "rewrite",
-            "rebuild",
-            "replace entire",
-            "from scratch",
-            "overhaul",
-            "redo whole",
-        ]
-        return any(k in msg for k in rewrite_keywords)
+Rules:
+- action must be one of: modify, create, delete
+- file_path is relative to the project root (e.g. src/pages/Home.jsx)
+- Keep the list focused. Only include files that actually need changes.
+- For routing changes, include the router/App file too.
+- Maximum 6 files per plan."""
 
-    def _apply_patch_edits(self, existing: str, edits: List[Dict[str, Any]]) -> str:
+    # ------------------------------------------------------------------ STEP 2: EDIT (per file)
+    def _build_edit_prompt(self, user_message: str, task: str, file_path: str,
+                           current_content: str, action: str) -> str:
+        if action == "create":
+            return f"""You are an expert React/Vite developer.
+Create a new file: {file_path}
+
+TASK: {task}
+USER REQUEST: {user_message}
+
+Return JSON only:
+{{
+  "file_path": "{file_path}",
+  "content": "...complete file content..."
+}}
+
+Rules:
+- Write complete, production-ready React/JSX code.
+- Include all imports.
+- Use Tailwind CSS for styling.
+- Export the component as default."""
+
+        # For modify action: send the file content and ask for the new version
+        return f"""You are an expert React/Vite developer editing an existing file.
+
+FILE: {file_path}
+TASK: {task}
+USER REQUEST: {user_message}
+
+CURRENT FILE CONTENT:
+{current_content}
+
+Return JSON only with the complete new file content:
+{{
+  "file_path": "{file_path}",
+  "content": "...complete updated file content..."
+}}
+
+Rules:
+- Return the COMPLETE file content, not just the changed parts.
+- Preserve all unrelated code, imports, and exports.
+- Maintain valid JSX/JS syntax.
+- Keep the same coding style as the original."""
+
+    # ------------------------------------------------------------------ path safety
+    def _normalize_file_path(self, rel_path: str) -> str:
+        return str(rel_path or "").replace("\\", "/").lstrip("/")
+
+    def _safe_file_path(self, target_dir: str, rel_path: str) -> Optional[str]:
+        clean_rel = self._normalize_file_path(rel_path)
+        if not clean_rel:
+            return None
+        base = os.path.abspath(target_dir)
+        candidate = os.path.abspath(os.path.join(base, clean_rel))
+        try:
+            if os.path.commonpath([base, candidate]) != base:
+                return None
+        except ValueError:
+            return None
+        return candidate
+
+    # ------------------------------------------------------------------ fuzzy patch (kept for repair)
+    def _find_fuzzy_span(self, existing: str, old_text: str) -> Optional[tuple]:
+        old_lines = old_text.splitlines()
+        existing_lines = existing.splitlines(keepends=True)
+        if not old_lines or not existing_lines:
+            return None
+        normalized_old = [line.strip() for line in old_lines if line.strip()]
+        if not normalized_old:
+            return None
+        window = len(normalized_old)
+        stripped_existing = [line.strip() for line in existing_lines]
+        for start_line in range(0, len(stripped_existing) - window + 1):
+            if stripped_existing[start_line:start_line + window] == normalized_old:
+                start = sum(len(line) for line in existing_lines[:start_line])
+                end = sum(len(line) for line in existing_lines[:start_line + window])
+                return start, end
+        best = difflib.SequenceMatcher(None, old_text, existing).find_longest_match(
+            0, len(old_text), 0, len(existing)
+        )
+        if best.size >= max(40, int(len(old_text) * 0.82)):
+            return best.b, best.b + best.size
+        return None
+
+    def _apply_patch_edits(self, existing: str, edits: List[Dict]) -> tuple:
         updated = existing
+        applied = 0
+        skipped = []
         for edit in edits:
             old_text = edit.get("old_text")
             new_text = edit.get("new_text", "")
-            if not isinstance(old_text, str) or not isinstance(new_text, str) or not old_text:
+            if not isinstance(old_text, str) or not old_text:
+                skipped.append("Patch edit skipped: missing old_text")
                 continue
-
-            # Replace only the first exact match to avoid broad destructive edits.
             if old_text in updated:
                 updated = updated.replace(old_text, new_text, 1)
-            else:
-                # If exact matching fails, keep file unchanged for this edit.
-                self.log("Patch edit skipped: old_text not found exactly.")
-        return updated
+                applied += 1
+                continue
+            crlf_old = old_text.replace("\n", "\r\n")
+            if crlf_old in updated:
+                updated = updated.replace(crlf_old, new_text.replace("\n", "\r\n"), 1)
+                applied += 1
+                continue
+            span = self._find_fuzzy_span(updated, old_text)
+            if span:
+                start, end = span
+                updated = updated[:start] + new_text + updated[end:]
+                applied += 1
+                continue
+            skipped.append(f"Patch not found: {old_text[:60]!r}")
+        return updated, applied, skipped
 
-    async def execute_edit(self, project_id: str, user_message: str) -> Dict[str, Any]:
-        """Execute a multi-step edit with real-time status updates."""
+    def _is_full_rewrite_requested(self, user_message: str) -> bool:
+        msg = (user_message or "").lower()
+        return any(k in msg for k in [
+            "rewrite", "rebuild", "replace entire", "from scratch", "overhaul", "redo whole"
+        ])
+
+    # ------------------------------------------------------------------ MAIN EXECUTE
+    async def execute_edit(self, project_id: str, user_message: str,
+                           chat_history: Optional[List[Dict]] = None) -> Dict[str, Any]:
+        """Execute a multi-step edit with decomposition for small-context models."""
         self.log(f"Executing edit for project {project_id} with msg: {user_message}")
-        
+
         target_dir = str(get_project_dir(project_id))
-        
         if not os.path.exists(target_dir):
             return {"error": "Project directory not found. Please wait for generation."}
-        
-        # Step 1: Scan project files
+
+        # ---- Step 1: Scan ----
         await self._emit_status("scanning", "Scanning project files...", {"step": 1, "total_steps": 4})
         all_files = self._scan_project_files(target_dir)
         file_tree = self._build_file_tree(target_dir)
-        
         await self._emit_status("scanning", f"Found {len(all_files)} editable files", {
             "step": 1, "total_steps": 4, "file_count": len(all_files)
         })
-        
-        # Step 2: Rank and read relevant files
-        await self._emit_status("analyzing", "Analyzing relevant files...", {"step": 2, "total_steps": 4})
-        ranked_files = self._rank_files(all_files, user_message, target_dir)
-        context = self._read_files_context(
-            ranked_files,
-            target_dir,
-            max_file_chars=self.MAX_FILE_CHARS,
-            max_total_chars=self.MAX_TOTAL_CONTEXT_CHARS,
-        )
-        
-        files_read = [os.path.relpath(f, target_dir) for f in ranked_files]
-        await self._emit_status("analyzing", f"Read {len(ranked_files)} relevant files", {
-            "step": 2, "total_steps": 4, "files_read": files_read
-        })
-        
-        # Step 3: Plan and generate changes via LLM
-        await self._emit_status("planning", "Planning changes with AI...", {"step": 3, "total_steps": 4})
 
-        prompt = self._build_prompt(user_message, file_tree, context)
-        
+        # ---- Step 2: Plan (small LLM call — file tree only, no file contents) ----
+        await self._emit_status("planning", "Planning changes with AI...", {"step": 2, "total_steps": 4})
+        chat_context = self._format_chat_history(chat_history or [])
+
         try:
-            if self.groq_client:
-                self.log(f"Attempting Groq model {self.groq_model}")
-                await self._emit_status("planning", f"Planning changes with Groq {self.groq_model}...", {"step": 3, "total_steps": 4})
-                
-                try:
-                    fallback_files = ranked_files[:self.FALLBACK_MAX_CONTEXT_FILES]
-                    fallback_tree = self._build_file_tree(target_dir, max_lines=self.FALLBACK_FILE_TREE_LINES)
-                    fallback_context = self._read_files_context(
-                        fallback_files,
-                        target_dir,
-                        max_file_chars=self.FALLBACK_MAX_FILE_CHARS,
-                        max_total_chars=self.FALLBACK_MAX_TOTAL_CONTEXT_CHARS,
-                    )
-                    fallback_prompt = self._build_fallback_prompt(user_message, fallback_tree, fallback_context)
-
-                    chat_completion = self.groq_client.chat.completions.create(
-                        messages=[
-                            {"role": "user", "content": fallback_prompt}
-                        ],
-                        model=self.groq_model,
-                        response_format={"type": "json_object"}
-                    )
-                    raw_json = chat_completion.choices[0].message.content
-                    self.log("Received response from Groq EditorAgent")
-                    parsed_response = json.loads(raw_json)
-                except Exception as groq_e:
-                    self.log(f"Groq failed: {str(groq_e)}")
-                    if self.gemini_model:
-                        self.log("Falling back to Gemini model")
-                        await self._emit_status("planning", "Groq failed, switching to Gemini API...", {"step": 3, "total_steps": 4})
-                        response = self.gemini_model.generate_content(
-                            prompt,
-                            generation_config=genai.GenerationConfig(
-                                response_mime_type="application/json",
-                            )
-                        )
-                        raw_json = response.text
-                        self.log("Received response from Gemini EditorAgent via fallback")
-                        parsed_response = json.loads(raw_json)
-                    else:
-                        await self._emit_status("error", "Failed to generate changes via Groq (No Gemini fallback)", {"step": 3, "total_steps": 4})
-                        return {"error": f"Editing failed on Groq. Error: {str(groq_e)}"}
-            elif self.gemini_model:
-                self.log("Attempting Gemini model for EditorAgent")
-                response = self.gemini_model.generate_content(
-                    prompt,
-                    generation_config=genai.GenerationConfig(
-                        response_mime_type="application/json",
-                    )
-                )
-                raw_json = response.text
-                self.log("Received response from Gemini EditorAgent")
-                parsed_response = json.loads(raw_json)
-            else:
-                 await self._emit_status("error", "Failed to generate changes, no LLM configured.", {"step": 3, "total_steps": 4})
-                 return {"error": "No LLM clients available."}
-
+            plan_prompt = self._build_plan_prompt(user_message, file_tree, chat_context)
+            plan_raw = self._call_llm(plan_prompt, expect_json=True)
+            plan_data = self._parse_json(plan_raw)
         except Exception as e:
-            self.log(f"Editing generation failed: {str(e)}")
-            await self._emit_status("error", "Failed to generate changes", {"step": 3, "total_steps": 4})
-            return {"error": f"Editing failed: {str(e)}"}
-        
-        # Step 4: Apply changes
-        changes = parsed_response.get("changes", [])
-        files_modified = parsed_response.get("files_modified", [])
-        
-        await self._emit_status("writing", f"Applying {len(changes)} file change(s)...", {
-            "step": 4, "total_steps": 4, "files": files_modified
+            self.log(f"Planning failed: {e}")
+            await self._emit_status("error", "Failed to plan changes", {"step": 2, "total_steps": 4})
+            return {"error": f"Planning failed: {e}"}
+
+        file_tasks = plan_data.get("file_tasks") or plan_data.get("items") or []
+        plan_summary = plan_data.get("plan", "")
+
+        if not file_tasks:
+            return {
+                "error": "The agent couldn't determine which files to change. Try a more specific instruction.",
+                "files_modified": [],
+            }
+
+        await self._emit_status("planning", f"Plan: {len(file_tasks)} file(s) to change", {
+            "step": 2, "total_steps": 4,
+            "files": [t.get("file_path", "") for t in file_tasks],
         })
-        
-        await self._apply_changes(target_dir, changes, user_message)
-        
-        # Done
-        await self._emit_status("complete", "All changes applied successfully!", {
-            "step": 4, "total_steps": 4, "files_modified": files_modified
-        })
-        
-        return {
-            "reply": parsed_response.get("agent_reply", "I've applied the changes."),
-            "plan": parsed_response.get("plan", ""),
-            "files_modified": files_modified
-        }
-            
-    async def _apply_changes(self, target_dir: str, changes: List[Dict[str, Any]], user_message: str):
-        """Write file changes to disk."""
+
+        # ---- Step 3: Edit each file individually (one LLM call per file) ----
+        await self._emit_status("writing", "Generating code changes...", {"step": 3, "total_steps": 4})
+        modified_files = []
+        skipped_all = []
         rewrite_allowed = self._is_full_rewrite_requested(user_message)
 
-        for change in changes:
-            rel_path = change.get("file_path")
-            action = (change.get("action") or "patch").lower()
-            if not isinstance(rel_path, str):
+        for i, task_item in enumerate(file_tasks[:6]):  # Cap at 6 files
+            rel_path = self._normalize_file_path(task_item.get("file_path", ""))
+            action = (task_item.get("action") or "modify").lower()
+            task_desc = task_item.get("task", user_message)
+
+            if not rel_path:
+                skipped_all.append("Skipped: empty file_path in plan")
                 continue
 
-            file_path = os.path.join(target_dir, str(rel_path))
-            # Security: ensure path stays within target_dir
-            if not os.path.abspath(file_path).startswith(os.path.abspath(target_dir)):
-                self.log(f"Warning: path traversal attempt prevented: {rel_path}")
+            file_path = self._safe_file_path(target_dir, rel_path)
+            if not file_path:
+                skipped_all.append(f"Skipped: unsafe path {rel_path}")
+                continue
+
+            await self._emit_status("writing",
+                f"Editing {rel_path} ({i+1}/{len(file_tasks)})...",
+                {"step": 3, "total_steps": 4, "current_file": rel_path})
+
+            if action == "delete":
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    modified_files.append(rel_path)
+                    self.log(f"Deleted: {rel_path}")
+                continue
+
+            # Read current content (empty for create)
+            current_content = ""
+            if action != "create" and os.path.exists(file_path):
+                current_content = self._read_single_file(file_path)
+
+            if action == "modify" and not os.path.exists(file_path):
+                action = "create"
+
+            try:
+                edit_prompt = self._build_edit_prompt(
+                    user_message, task_desc, rel_path, current_content, action
+                )
+                edit_raw = self._call_llm(edit_prompt, expect_json=True)
+                edit_data = self._parse_json(edit_raw)
+            except Exception as e:
+                skipped_all.append(f"LLM failed for {rel_path}: {e}")
+                self.log(f"Edit call failed for {rel_path}: {e}")
+                continue
+
+            new_content = edit_data.get("content")
+            edits = edit_data.get("edits")
+
+            # If the LLM returned patch-style edits instead of full content
+            if edits and isinstance(edits, list) and current_content:
+                updated, applied, patch_skipped = self._apply_patch_edits(current_content, edits)
+                skipped_all.extend([f"{rel_path}: {s}" for s in patch_skipped])
+                if applied > 0 and updated != current_content:
+                    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(updated)
+                    modified_files.append(rel_path)
+                    self.log(f"Patched: {rel_path} ({applied} edits)")
+                elif not new_content:
+                    skipped_all.append(f"No effective patches for {rel_path}")
+                continue
+
+            if not isinstance(new_content, str) or not new_content.strip():
+                skipped_all.append(f"Empty content returned for {rel_path}")
+                continue
+
+            # Safety: avoid destructive rewrites unless explicitly asked
+            if (action == "modify" and current_content and not rewrite_allowed
+                    and len(new_content) < len(current_content) * 0.3):
+                looks_valid = any(kw in new_content for kw in [
+                    "export default", "export {", "function ", "const ", "import "
+                ])
+                if not looks_valid:
+                    skipped_all.append(f"Blocked tiny rewrite for {rel_path}")
+                    continue
+
+            if current_content and new_content.strip() == current_content.strip():
+                skipped_all.append(f"No changes detected for {rel_path}")
                 continue
 
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            modified_files.append(rel_path)
+            self.log(f"{'Created' if action == 'create' else 'Modified'}: {rel_path}")
 
-            # Preferred path: patch existing files with targeted edits.
-            edits = change.get("edits") if isinstance(change.get("edits"), list) else []
-            if action == "patch" and edits:
-                if not os.path.exists(file_path):
-                    self.log(f"Patch skipped, file missing: {rel_path}")
-                    continue
-                with open(file_path, "r", encoding="utf-8") as f:
-                    existing = f.read()
-                updated = self._apply_patch_edits(existing, edits)
-                if updated != existing:
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(updated)
-                    self.log(f"Patched file: {rel_path}")
-                else:
-                    self.log(f"No effective patch changes for: {rel_path}")
-                continue
+        # ---- Step 4: Report ----
+        if not modified_files:
+            await self._emit_status("error", "No files were changed.", {
+                "step": 4, "total_steps": 4, "skipped": skipped_all[:5]
+            })
+            return {
+                "error": "I planned the change but couldn't apply edits to the files. Try a more specific instruction or ask me to rebuild the target page.",
+                "files_modified": [],
+            }
 
-            content = change.get("content")
-            if not isinstance(content, str):
-                continue
+        await self._emit_status("complete", f"Applied changes to {len(modified_files)} file(s)!", {
+            "step": 4, "total_steps": 4, "files_modified": modified_files,
+        })
 
-            if action == "create":
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(str(content))
-                self.log(f"Created file: {rel_path}")
-                continue
+        # Build a friendly reply
+        agent_reply = plan_data.get("agent_reply") or f"Done! I updated {len(modified_files)} file(s): {', '.join(modified_files)}."
 
-            if action == "modify":
-                # Guardrail: avoid destructive full rewrites unless explicitly asked.
-                if os.path.exists(file_path) and not rewrite_allowed:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        existing = f.read()
-                    if existing and len(content) < int(len(existing) * 0.6):
-                        self.log(f"Blocked destructive rewrite for: {rel_path}")
-                        continue
-
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(str(content))
-                self.log(f"Modified file: {rel_path}")
+        return {
+            "reply": agent_reply,
+            "plan": plan_summary,
+            "files_modified": sorted(set(modified_files)),
+        }

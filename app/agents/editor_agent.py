@@ -9,6 +9,7 @@ from groq import Groq
 
 from app.config import settings
 from app.agents.base_agent import BaseAgent
+from app.services.project_validation_service import ProjectValidationResult, ProjectValidationService
 from app.utils.paths import get_project_dir
 
 genai.configure(api_key=settings.GEMINI_API_KEY)
@@ -30,6 +31,10 @@ class EditorAgent(BaseAgent):
     # Per-file caps (kept small for free-tier models)
     MAX_FILE_CHARS = 8000
     MAX_PLAN_TREE_LINES = 120
+    MAX_REPAIR_ATTEMPTS = 2
+    MAX_REPAIR_FILES = 4
+    MAX_REPAIR_FILE_CHARS = 12000
+    MAX_REPAIR_ERROR_CHARS = 9000
 
     def __init__(self):
         # --- Groq (primary) ---
@@ -106,6 +111,16 @@ class EditorAgent(BaseAgent):
         except Exception as e:
             self.log(f"Failed to read {file_path}: {e}")
             return ""
+
+    def _read_full_file(self, file_path: str) -> Optional[str]:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            self.log(f"Failed to snapshot {file_path}: {e}")
+            return None
 
     def _format_chat_history(self, chat_history: List[Dict]) -> str:
         """Format recent chat messages as context for the LLM."""
@@ -330,6 +345,227 @@ Rules:
             "rewrite", "rebuild", "replace entire", "from scratch", "overhaul", "redo whole"
         ])
 
+    # ------------------------------------------------------------------ validation + repair
+    def _strip_ansi(self, text: str) -> str:
+        return re.sub(r"\x1b\[[0-9;]*m", "", text or "")
+
+    def _remember_original(self, rel_path: str, file_path: str, snapshots: Dict[str, Optional[str]]):
+        rel_path = self._normalize_file_path(rel_path)
+        if rel_path not in snapshots:
+            snapshots[rel_path] = self._read_full_file(file_path)
+
+    def _rollback_files(self, target_dir: str, snapshots: Dict[str, Optional[str]]) -> List[str]:
+        restored = []
+        for rel_path, original_content in snapshots.items():
+            file_path = self._safe_file_path(target_dir, rel_path)
+            if not file_path:
+                continue
+            try:
+                if original_content is None:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                else:
+                    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(original_content)
+                restored.append(rel_path)
+            except Exception as exc:
+                self.log(f"Rollback failed for {rel_path}: {exc}")
+        return restored
+
+    def _error_path_to_relative(self, target_dir: str, path_value: str) -> Optional[str]:
+        if not path_value:
+            return None
+        cleaned = path_value.strip().strip("'\"`").replace("\\", "/")
+        base = os.path.abspath(target_dir)
+
+        if re.match(r"^[A-Za-z]:/", cleaned) or cleaned.startswith("/"):
+            candidate = os.path.abspath(cleaned)
+            try:
+                if os.path.commonpath([base, candidate]) == base:
+                    return os.path.relpath(candidate, base).replace("\\", "/")
+            except ValueError:
+                return None
+
+        marker = "/src/"
+        if marker in cleaned:
+            return "src/" + cleaned.split(marker, 1)[1]
+
+        if cleaned.startswith("src/"):
+            return cleaned
+
+        return None
+
+    def _extract_error_file_paths(self, target_dir: str, output: str) -> List[str]:
+        text = self._strip_ansi(output)
+        patterns = [
+            r"([A-Za-z]:[^\n\r]*?\.(?:jsx|js|tsx|ts|css|json|html))(?::\d+:\d+)?",
+            r"((?:src|app|pages|components|layouts|store|utils)[\\/][^\s:()]+?\.(?:jsx|js|tsx|ts|css|json|html))(?::\d+:\d+)?",
+        ]
+        found = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                rel = self._error_path_to_relative(target_dir, match.group(1))
+                if rel and rel not in found:
+                    found.append(rel)
+        return found
+
+    def _build_repair_prompt(self, validation: ProjectValidationResult, file_payloads: List[Dict[str, str]]) -> str:
+        error_output = self._strip_ansi(validation.output)[-self.MAX_REPAIR_ERROR_CHARS:]
+        files_block = "\n\n".join(
+            f"FILE: {item['file_path']}\n```jsx\n{item['content']}\n```"
+            for item in file_payloads
+        )
+        return f"""You are an expert React/Vite repair agent.
+The previous code edit made the generated project fail its Vite production build.
+Fix the compiler/build error while preserving the requested feature and unrelated code.
+
+BUILD COMMAND:
+{" ".join(validation.command)}
+
+BUILD ERROR:
+{error_output}
+
+FILES TO REPAIR:
+{files_block}
+
+Return JSON only:
+{{
+  "analysis": "short explanation of the root cause",
+  "file_updates": [
+    {{
+      "file_path": "src/components/Footer.jsx",
+      "content": "...complete corrected file content..."
+    }}
+  ]
+}}
+
+Rules:
+- Return complete file contents for every file you update.
+- Keep JSX valid. JavaScript prop values such as arrays/objects/functions must be wrapped in braces, for example links={{[{{ label: "Shop", to: "/shop" }}]}}.
+- Do not rewrite unrelated design or behavior.
+- Prefer the smallest set of file updates that fixes the build.
+- Do not include markdown outside the JSON."""
+
+    def _collect_repair_payloads(
+        self,
+        target_dir: str,
+        validation: ProjectValidationResult,
+        modified_files: List[str],
+    ) -> List[Dict[str, str]]:
+        candidate_paths = []
+        for rel_path in self._extract_error_file_paths(target_dir, validation.output):
+            if rel_path not in candidate_paths:
+                candidate_paths.append(rel_path)
+        for rel_path in modified_files:
+            clean = self._normalize_file_path(rel_path)
+            if clean and clean not in candidate_paths:
+                candidate_paths.append(clean)
+
+        payloads = []
+        for rel_path in candidate_paths[:self.MAX_REPAIR_FILES]:
+            file_path = self._safe_file_path(target_dir, rel_path)
+            if not file_path or not os.path.exists(file_path):
+                continue
+            payloads.append({
+                "file_path": rel_path,
+                "content": self._read_single_file(file_path, max_chars=self.MAX_REPAIR_FILE_CHARS),
+            })
+        return payloads
+
+    def _apply_file_updates(
+        self,
+        target_dir: str,
+        updates: List[Dict[str, Any]],
+        original_snapshots: Dict[str, Optional[str]],
+    ) -> tuple[List[str], List[str]]:
+        modified = []
+        skipped = []
+        for update in updates[:6]:
+            rel_path = self._normalize_file_path(update.get("file_path", ""))
+            content = update.get("content")
+            if not rel_path or not isinstance(content, str) or not content.strip():
+                skipped.append(f"Skipped invalid repair update for {rel_path or 'unknown file'}")
+                continue
+            file_path = self._safe_file_path(target_dir, rel_path)
+            if not file_path:
+                skipped.append(f"Skipped unsafe repair path {rel_path}")
+                continue
+            self._remember_original(rel_path, file_path, original_snapshots)
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            modified.append(rel_path)
+        return modified, skipped
+
+    async def _validate_and_repair(
+        self,
+        project_id: str,
+        target_dir: str,
+        modified_files: List[str],
+        original_snapshots: Dict[str, Optional[str]],
+    ) -> tuple[ProjectValidationResult, List[str], List[str]]:
+        await self._emit_status("analyzing", "Checking generated app for compiler errors...", {
+            "step": 4,
+            "total_steps": 5,
+        })
+        validation = await ProjectValidationService.validate_project(project_id)
+        if validation.success:
+            if validation.skipped:
+                await self._emit_status("analyzing", validation.reason, {"step": 4, "total_steps": 5})
+            return validation, [], []
+
+        repaired_files = []
+        repair_notes = []
+        for attempt in range(1, self.MAX_REPAIR_ATTEMPTS + 1):
+            await self._emit_status("repairing", f"Build failed. Repairing code automatically ({attempt}/{self.MAX_REPAIR_ATTEMPTS})...", {
+                "step": 4,
+                "total_steps": 5,
+                "error": self._strip_ansi(validation.output)[-1200:],
+            })
+
+            payloads = self._collect_repair_payloads(target_dir, validation, modified_files + repaired_files)
+            if not payloads:
+                repair_notes.append("No repairable source files could be identified from the build output.")
+                break
+
+            try:
+                repair_raw = self._call_llm(self._build_repair_prompt(validation, payloads), expect_json=True)
+                repair_data = self._parse_json(repair_raw)
+            except Exception as exc:
+                repair_notes.append(f"Repair LLM failed: {exc}")
+                self.log(f"Repair LLM failed: {exc}")
+                break
+
+            updates = repair_data.get("file_updates") or repair_data.get("files") or repair_data.get("updates") or []
+            if not isinstance(updates, list) or not updates:
+                repair_notes.append("Repair agent returned no file updates.")
+                break
+
+            changed, skipped = self._apply_file_updates(target_dir, updates, original_snapshots)
+            repaired_files.extend(changed)
+            repair_notes.extend(skipped)
+
+            if not changed:
+                repair_notes.append("Repair attempt did not change any files.")
+                break
+
+            await self._emit_status("analyzing", "Rechecking repaired project...", {
+                "step": 4,
+                "total_steps": 5,
+                "files": changed,
+            })
+            validation = await ProjectValidationService.validate_project(project_id)
+            if validation.success:
+                await self._emit_status("repairing", "Compiler error repaired automatically.", {
+                    "step": 4,
+                    "total_steps": 5,
+                    "files": changed,
+                })
+                return validation, repaired_files, repair_notes
+
+        return validation, repaired_files, repair_notes
+
     # ------------------------------------------------------------------ MAIN EXECUTE
     async def execute_edit(self, project_id: str, user_message: str,
                            chat_history: Optional[List[Dict]] = None) -> Dict[str, Any]:
@@ -379,6 +615,7 @@ Rules:
         await self._emit_status("writing", "Generating code changes...", {"step": 3, "total_steps": 4})
         modified_files = []
         skipped_all = []
+        original_snapshots: Dict[str, Optional[str]] = {}
         rewrite_allowed = self._is_full_rewrite_requested(user_message)
 
         for i, task_item in enumerate(file_tasks[:6]):  # Cap at 6 files
@@ -401,6 +638,7 @@ Rules:
 
             if action == "delete":
                 if os.path.exists(file_path):
+                    self._remember_original(rel_path, file_path, original_snapshots)
                     os.remove(file_path)
                     modified_files.append(rel_path)
                     self.log(f"Deleted: {rel_path}")
@@ -433,6 +671,7 @@ Rules:
                 updated, applied, patch_skipped = self._apply_patch_edits(current_content, edits)
                 skipped_all.extend([f"{rel_path}: {s}" for s in patch_skipped])
                 if applied > 0 and updated != current_content:
+                    self._remember_original(rel_path, file_path, original_snapshots)
                     os.makedirs(os.path.dirname(file_path), exist_ok=True)
                     with open(file_path, "w", encoding="utf-8") as f:
                         f.write(updated)
@@ -460,6 +699,7 @@ Rules:
                 skipped_all.append(f"No changes detected for {rel_path}")
                 continue
 
+            self._remember_original(rel_path, file_path, original_snapshots)
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(new_content)
@@ -476,15 +716,56 @@ Rules:
                 "files_modified": [],
             }
 
-        await self._emit_status("complete", f"Applied changes to {len(modified_files)} file(s)!", {
-            "step": 4, "total_steps": 4, "files_modified": modified_files,
+        validation, repaired_files, repair_notes = await self._validate_and_repair(
+            project_id,
+            target_dir,
+            modified_files,
+            original_snapshots,
+        )
+        if repaired_files:
+            modified_files.extend(repaired_files)
+
+        if not validation.success:
+            restored_files = self._rollback_files(target_dir, original_snapshots)
+            await self._emit_status("error", "The edit broke the generated app and automatic repair did not stabilize it. Changes were rolled back.", {
+                "step": 5,
+                "total_steps": 5,
+                "restored_files": restored_files,
+            })
+            return {
+                "error": (
+                    "The edit caused a build error and automatic repair could not fix it safely. "
+                    "I rolled the files back so the preview stays stable.\n\n"
+                    f"{self._strip_ansi(validation.output)[-1800:]}"
+                ),
+                "files_modified": [],
+                "rolled_back": True,
+                "restored_files": restored_files,
+                "repair_notes": repair_notes,
+            }
+
+        unique_modified_files = sorted(set(modified_files))
+        await self._emit_status("complete", f"Applied and validated changes to {len(unique_modified_files)} file(s)!", {
+            "step": 5,
+            "total_steps": 5,
+            "files_modified": unique_modified_files,
+            "validation_skipped": validation.skipped,
+            "repaired_files": sorted(set(repaired_files)),
         })
 
         # Build a friendly reply
-        agent_reply = plan_data.get("agent_reply") or f"Done! I updated {len(modified_files)} file(s): {', '.join(modified_files)}."
+        agent_reply = plan_data.get("agent_reply") or f"Done! I updated {len(unique_modified_files)} file(s): {', '.join(unique_modified_files)}."
+        if repaired_files:
+            agent_reply += " I also caught and repaired a build error before refreshing the preview."
 
         return {
             "reply": agent_reply,
             "plan": plan_summary,
-            "files_modified": sorted(set(modified_files)),
+            "files_modified": unique_modified_files,
+            "validation": {
+                "success": validation.success,
+                "skipped": validation.skipped,
+                "reason": validation.reason,
+                "repaired_files": sorted(set(repaired_files)),
+            },
         }

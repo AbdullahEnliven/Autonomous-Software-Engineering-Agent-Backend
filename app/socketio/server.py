@@ -258,13 +258,28 @@ async def handle_chat_message(sid, data):
             except Exception as exc:
                 print(f"Failed to persist agent error message: {exc}")
 
+            if result.get("rolled_back"):
+                await PreviewManager.restart_preview(project_id)
+                await sio.emit(
+                    "code_updated",
+                    {
+                        "project_id": project_id,
+                        "updated_at": int(time.time() * 1000),
+                        "rolled_back": True,
+                        "restored_files": result.get("restored_files", []),
+                    },
+                    room=project_id,
+                )
+
             await sio.emit("agent_reply", {
                 "project_id": project_id,
                 "id": str(persisted.id) if persisted else None,
                 "role": "agent",
                 "message": error_message,
                 "files_modified": [],
-                "plan": ""
+                "plan": "",
+                "rolled_back": result.get("rolled_back", False),
+                "restored_files": result.get("restored_files", []),
             }, room=project_id)
             return
 

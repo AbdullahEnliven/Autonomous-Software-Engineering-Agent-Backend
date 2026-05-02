@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 
 import httpx
 import google.generativeai as genai
-from groq import Groq
+from app.utils.groq_client import get_groq_client
 
 from app.config import settings
 
@@ -17,7 +17,7 @@ class StoreImageKeywordAgent:
 
     def __init__(self):
         self.gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-        self.groq_client = Groq(api_key=settings.GROQ_API_KEY) if settings.GROQ_API_KEY else None
+        self.groq_client = get_groq_client()
 
     def _fallback_queries(self, store_name: str, store_description: str) -> Dict[str, str]:
         text = f"{store_name} {store_description}".lower()

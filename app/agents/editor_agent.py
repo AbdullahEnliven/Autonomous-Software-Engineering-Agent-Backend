@@ -5,7 +5,7 @@ import re
 import difflib
 from typing import Dict, Any, List, Optional
 import google.generativeai as genai
-from groq import Groq
+from app.utils.groq_client import get_groq_client
 
 from app.config import settings
 from app.agents.base_agent import BaseAgent
@@ -38,10 +38,8 @@ class EditorAgent(BaseAgent):
 
     def __init__(self):
         # --- Groq (primary) ---
-        self.groq_client = None
-        if settings.GROQ_API_KEY:
-            self.groq_client = Groq(api_key=settings.GROQ_API_KEY)
-            self.groq_model = settings.GROQ_LLM_MODEL
+        self.groq_client = get_groq_client()
+        self.groq_model = settings.GROQ_LLM_MODEL
 
 
 

@@ -2,7 +2,7 @@ import google.generativeai as genai
 import json
 import logging
 from typing import Dict, Any
-from groq import Groq
+from app.utils.groq_client import get_groq_client
 
 from app.config import settings
 from app.models.project import Specification, Requirement
@@ -15,10 +15,8 @@ class SpecificationAgent(BaseAgent):
     
     def __init__(self):
         # Always use Groq client first, fallback currently acts as the primary
-        self.groq_client = None
-        if settings.GROQ_API_KEY:
-            self.groq_client = Groq(api_key=settings.GROQ_API_KEY)
-            self.groq_model = settings.GROQ_LLM_MODEL
+        self.groq_client = get_groq_client()
+        self.groq_model = settings.GROQ_LLM_MODEL
 
         # We use a model that handles JSON reliably.
         self.gemini_model = None

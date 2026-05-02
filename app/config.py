@@ -16,8 +16,9 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = "your-gemini-key"
     GOOGLE_API_KEY: str = "your-google-api-key"
     
-    # Groq Fallback
-    GROQ_API_KEY: str = ""
+    # Groq Fallback (Multiple keys supported, comma separated)
+    GROQ_API_KEYS: str = ""
+    GROQ_API_KEY: str = ""  # Left for backwards compatibility
     GROQ_LLM_MODEL: str = "llama-3.3-70b-versatile"
 
     # Image Personalization

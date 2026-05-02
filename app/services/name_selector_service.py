@@ -1,7 +1,7 @@
 import json
 import re
 
-from groq import Groq
+from app.utils.groq_client import get_groq_client
 
 from app.config import settings
 
@@ -49,7 +49,8 @@ class NameSelectorService:
         category: str | None = None,
         target_market: str | None = None,
     ) -> str:
-        if not settings.GROQ_API_KEY:
+        client = get_groq_client()
+        if not client:
             return cls._fallback_name(requirements, category)
 
         prompt = f"""
@@ -70,7 +71,6 @@ Rules:
 """.strip()
 
         try:
-            client = Groq(api_key=settings.GROQ_API_KEY)
             completion = client.chat.completions.create(
                 model=settings.GROQ_LLM_MODEL,
                 temperature=0.5,

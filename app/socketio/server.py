@@ -94,7 +94,7 @@ async def disconnect(sid):
 
     for project_id in joined_projects:
         await PreviewManager.unregister_viewer(project_id, sid)
-        await PreviewManager.stop_if_idle(project_id)
+        # Vercel previews are persistent — no local processes to stop
 
 @sio.on("join_project")
 async def join_project(sid, data):
@@ -117,8 +117,9 @@ async def join_project(sid, data):
     print(f"Client {sid} joined room: {project_id}")
     await sio.emit("notification", {"type": "info", "message": f"Joined project {project_id}"}, to=sid)
 
-    # Start the preview server if it's not already running.
-    await PreviewManager.start_preview(project_id)
+    # Emit current Vercel preview status so the frontend knows the state immediately
+    preview_status = PreviewManager.get_status(project_id)
+    await sio.emit("preview_status", preview_status, to=sid)
 
 @sio.on("leave_project")
 async def leave_project(sid, data):
@@ -134,7 +135,6 @@ async def leave_project(sid, data):
             client_projects.pop(sid, None)
 
     await PreviewManager.unregister_viewer(project_id, sid)
-    await PreviewManager.stop_if_idle(project_id)
     print(f"Client {sid} left room: {project_id}")
 
 @sio.on("chat_message")
@@ -259,6 +259,7 @@ async def handle_chat_message(sid, data):
                 print(f"Failed to persist agent error message: {exc}")
 
             if result.get("rolled_back"):
+                # Invalidate preview cache so next view triggers fresh deploy
                 await PreviewManager.restart_preview(project_id)
                 await sio.emit(
                     "code_updated",
@@ -334,6 +335,8 @@ async def handle_chat_message(sid, data):
         except Exception as exc:
             print(f"Failed to persist agent reply: {exc}")
 
+        # Invalidate preview — user will see "code changed" state.
+        # The next time they open the preview tab, a fresh Vercel deploy will be triggered.
         await PreviewManager.restart_preview(project_id)
         await sio.emit("agent_reply", {
             "project_id": project_id,
@@ -347,7 +350,12 @@ async def handle_chat_message(sid, data):
             "github_push": github_push,
         }, room=project_id)
 
-        # Notify clients to trigger preview refresh UX; Vite HMR still handles direct code pushes.
+        # Notify clients that preview needs refresh
+        await sio.emit(
+            "preview_status",
+            {"status": "idle", "url": None, "message": "Code updated — click Preview to refresh"},
+            room=project_id,
+        )
         await sio.emit(
             "code_updated",
             {

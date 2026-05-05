@@ -1,16 +1,18 @@
-from fastapi import APIRouter, Depends, status, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import APIRouter, Depends, status, HTTPException, BackgroundTasks, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List
+from typing import List, Optional
 from pathlib import Path
 import hashlib
+import httpx
+import json
 import tempfile
 import zipfile
 import time
 
 from app.database import get_db, async_session_maker
 from app.models.user import User
-from app.models.project import Specification, GenerationJobStatus
+from app.models.project import Specification, GenerationJobStatus, Integration, IntegrationType
 from app.dependencies import get_current_user
 from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse
 from app.schemas.requirement import RequirementCreate
@@ -23,7 +25,10 @@ from app.services.version_control_service import VersionControlService
 from app.services.integration_service import IntegrationService
 from app.services.name_selector_service import NameSelectorService
 from app.services.preview_manager import PreviewManager
+from app.services.deployment_service import DeploymentService
 from app.utils.paths import get_project_dir
+from app.config import settings
+from app.socketio.server import sio
 from pydantic import BaseModel
 from sqlalchemy.future import select
 
@@ -403,41 +408,232 @@ async def download_project_zip(
         media_type="application/zip",
     )
 
+# ---------------------------------------------------------------------------
+# Preview endpoints (Vercel-based)
+# ---------------------------------------------------------------------------
+
+@router.get("/{project_id}/preview-status")
+async def get_preview_status(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Returns current preview state:
+      { status: idle|deploying|ready|error, url: str|null, message: str }
+    Does NOT trigger a deploy — call POST /preview/trigger for that.
+    """
+    await ProjectService.get_project(db, project_id, current_user.id)
+
+    # Read DB integration for all stored URLs
+    result = await db.execute(
+        select(Integration).where(
+            Integration.project_id == project_id,
+            Integration.type == IntegrationType.vercel,
+        )
+    )
+    integration = result.scalars().first()
+    stored_url: Optional[str] = None
+    stored_hash: Optional[str] = None
+    production_url: Optional[str] = None
+    if integration and integration.encrypted_credentials:
+        try:
+            creds = json.loads(integration.encrypted_credentials)
+            stored_url = creds.get("preview_url")
+            stored_hash = creds.get("preview_file_hash")
+            production_url = creds.get("production_url")
+        except Exception:
+            pass
+
+    mem_status = PreviewManager.get_status(project_id)
+
+    # If in-memory says ready, trust it — enrich with production_url
+    if mem_status["status"] == "ready" and mem_status["url"]:
+        return JSONResponse({**mem_status, "production_url": production_url})
+
+    # If DB has a URL, return it as ready (memory was cleared by restart)
+    if stored_url:
+        return JSONResponse({
+            "status": "ready",
+            "url": stored_url,
+            "message": "Preview ready",
+            "file_hash": stored_hash,
+            "production_url": production_url,
+        })
+
+    return JSONResponse({**mem_status, "production_url": production_url})
+
+
+@router.get("/{project_id}/preview-proxy")
+async def preview_proxy(
+    project_id: str,
+    token: str,                         # JWT passed as ?token= since iframes can't send headers
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Transparent reverse-proxy for the Vercel preview page.
+    Fetches the page server-side and strips X-Frame-Options / CSP headers
+    so the frontend can embed it in an iframe without 'refused to connect'.
+    Token is accepted as a query parameter (iframes cannot set Authorization headers).
+    """
+    from jose import jwt, JWTError
+    from app.config import settings
+    from app.utils.security import ALGORITHM
+
+    # Validate token manually (same logic as get_current_user)
+    credentials_exc = HTTPException(status_code=401, detail="Could not validate credentials")
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if not user_id:
+            raise credentials_exc
+    except JWTError:
+        raise credentials_exc
+
+    result_user = await db.execute(select(User).where(User.id == user_id))
+    current_user = result_user.scalars().first()
+    if not current_user or not current_user.is_active:
+        raise credentials_exc
+
+    # Verify the user owns this project
+    await ProjectService.get_project(db, project_id, current_user.id)
+
+    # Look up the current preview URL (in-memory first, then DB)
+    from app.services.preview_manager import PreviewManager
+    mem = PreviewManager.get_status(project_id)
+    preview_url: Optional[str] = mem.get("url") if mem.get("status") == "ready" else None
+
+    if not preview_url:
+        result_int = await db.execute(
+            select(Integration).where(
+                Integration.project_id == project_id,
+                Integration.type == IntegrationType.vercel,
+            )
+        )
+        integration = result_int.scalars().first()
+        if integration and integration.encrypted_credentials:
+            try:
+                creds = json.loads(integration.encrypted_credentials)
+                preview_url = creds.get("preview_url")
+            except Exception:
+                pass
+
+    if not preview_url:
+        raise HTTPException(status_code=404, detail="No preview URL available. Trigger a preview build first.")
+
+    # Fetch the Vercel page server-side
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
+            resp = await client.get(preview_url, headers={"User-Agent": "ASEA-PreviewProxy/1.0"})
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach preview URL: {exc}")
+
+    # Strip headers that block iframe embedding
+    STRIP = {"x-frame-options", "content-security-policy", "x-content-type-options",
+             "transfer-encoding", "connection", "content-encoding", "content-length"}
+    safe_headers = {k: v for k, v in resp.headers.items() if k.lower() not in STRIP}
+    safe_headers["X-Frame-Options"] = "ALLOWALL"
+    safe_headers["Access-Control-Allow-Origin"] = "*"
+
+    content_type = resp.headers.get("content-type", "text/html; charset=utf-8")
+    content = resp.content
+
+    # Inject <base href="..."> for HTML responses so relative SPA assets load from Vercel
+    if b"text/html" in content_type.lower().encode():
+        base_tag = f'<base href="{preview_url}/">\n'.encode("utf-8")
+        if b"<head>" in content:
+            content = content.replace(b"<head>", b"<head>\n" + base_tag, 1)
+        else:
+            content = base_tag + content
+
+    return Response(
+        content=content,
+        status_code=resp.status_code,
+        headers=safe_headers,
+        media_type=content_type,
+    )
+
+
+@router.post("/{project_id}/preview/trigger")
+async def trigger_preview_deploy(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Triggers a Vercel preview deploy (non-blocking).
+    Returns immediately with current status; frontend polls /preview-status
+    or listens for the `preview_status` Socket.IO event.
+    """
+    await ProjectService.get_project(db, project_id, current_user.id)
+
+    if not settings.VERCEL_TOKEN:
+        raise HTTPException(
+            status_code=400,
+            detail="VERCEL_TOKEN is not configured. Cannot deploy preview.",
+        )
+
+    # Get stored state from DB
+    result = await db.execute(
+        select(Integration).where(
+            Integration.project_id == project_id,
+            Integration.type == IntegrationType.vercel,
+        )
+    )
+    integration = result.scalars().first()
+    stored_url: Optional[str] = None
+    stored_hash: Optional[str] = None
+    project_slug: str = f"{settings.VERCEL_PROJECT_PREFIX}-{str(project_id)[:8]}".lower()
+    if integration and integration.encrypted_credentials:
+        try:
+            creds = json.loads(integration.encrypted_credentials)
+            stored_url = creds.get("preview_url")
+            stored_hash = creds.get("preview_file_hash")
+            project_slug = creds.get("project_slug") or project_slug
+        except Exception:
+            pass
+
+    # Open a new DB session for the background task (the current `db` session
+    # belongs to this request and will be closed when it ends).
+    async with async_session_maker() as bg_db:
+        result_dict = await PreviewManager.get_or_create_preview(
+            project_id=project_id,
+            vercel_token=settings.VERCEL_TOKEN,
+            vercel_scope=settings.VERCEL_SCOPE,
+            project_slug=project_slug,
+            sio=sio,
+            db=bg_db,
+            stored_url=stored_url,
+            stored_hash=stored_hash,
+        )
+
+    return JSONResponse(result_dict)
+
+
+# Legacy route kept for backward-compat — redirects to the new trigger flow
 @router.get("/{project_id}/preview/{page}", response_class=HTMLResponse)
-async def get_project_preview(project_id: str, page: str, current_user: User = Depends(get_current_user)):
-    """Return specific preview HTML based on stable generated port."""
-    # Ensure user has access to the project before serving preview markup.
-    async with async_session_maker() as db:
-        await ProjectService.get_project(db, project_id, current_user.id)
-
-    # Deterministic port based on Project ID
-    port = PreviewManager.get_port(project_id)
-
-    # Try to start preview (non-blocking quick check, 3s max)
-    is_ready = await PreviewManager.ensure_preview_ready(project_id, timeout_seconds=3.0)
-    if not is_ready:
-        return HTMLResponse(content="""
-        <html><head>
-        <meta http-equiv="refresh" content="3">
-        <style>
-          body { margin:0; font-family: Arial, sans-serif; background:#0f172a; color:#e5e7eb; display:flex; align-items:center; justify-content:center; min-height:100vh; }
-          .card { max-width:560px; padding:24px; border:1px solid rgba(255,255,255,.12); border-radius:14px; background:rgba(255,255,255,.04); text-align:center; }
-          h2 { margin:0 0 8px 0; font-size:20px; }
-          p { margin:0; color:#cbd5e1; line-height:1.45; }
-          .spinner { display:inline-block; width:24px; height:24px; border:3px solid rgba(255,255,255,0.15); border-top:3px solid #3b82f6; border-radius:50%; animation:spin 0.8s linear infinite; margin-bottom:12px; }
-          @keyframes spin { to { transform:rotate(360deg); } }
-        </style>
-        </head><body>
-        <div class='card'>
-          <div class='spinner'></div>
-          <h2>Preview is still starting</h2>
-          <p>Your local preview server is waking up. This page will auto-refresh...</p>
-        </div>
-        </body></html>
-        """)
-
-    page_path = "" if page == "home" else page.lower()
-    cache_buster = int(time.time() * 1000)
-    return HTMLResponse(content=f"""<style>body {{ margin: 0; padding: 0; overflow: hidden; }} iframe {{ width: 100vw; height: 100vh; border: none; }}</style><iframe src="http://localhost:{port}/{page_path}?_asea_v={cache_buster}"></iframe>""")
+async def get_project_preview_legacy(
+    project_id: str,
+    page: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Backward-compat stub. Returns a redirect page pointing to Vercel preview."""
+    status_dict = PreviewManager.get_status(project_id)
+    url = status_dict.get("url")
+    if url:
+        page_path = "" if page == "home" else page.lower()
+        target = f"{url.rstrip('/')}/{page_path}" if page_path else url
+        return HTMLResponse(
+            content=f"""<style>body{{margin:0;padding:0;overflow:hidden}}
+            iframe{{width:100vw;height:100vh;border:none}}</style>
+            <iframe src="{target}"></iframe>"""
+        )
+    return HTMLResponse(
+        content="""<html><body style='font-family:sans-serif;display:flex;
+        align-items:center;justify-content:center;height:100vh;background:#0f172a;color:#e5e7eb'>
+        <div style='text-align:center'><h2>Preview not ready</h2>
+        <p>Use the builder to trigger a Vercel preview deploy.</p></div>
+        </body></html>"""
+    )
 
 

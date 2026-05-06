@@ -20,9 +20,12 @@ app = FastAPI(
 )
 
 # Set up CORS
+# - settings.all_cors_origins: explicit list (localhost + any FRONTEND_URL / RAILWAY_PUBLIC_DOMAIN)
+# - allow_origin_regex: automatically allows ALL *.railway.app and *.up.railway.app subdomains
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=settings.all_cors_origins,
+    allow_origin_regex=r"https://.*\.railway\.app|https://.*\.up\.railway\.app|https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

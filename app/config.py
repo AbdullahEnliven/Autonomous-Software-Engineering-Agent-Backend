@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
+import os
 
 class Settings(BaseSettings):
     APP_ENV: str = "development"
@@ -61,7 +62,30 @@ class Settings(BaseSettings):
     SENTRY_DSN: str = ""
     FRONTEND_URL: str = "http://localhost:5173"
     CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:8000", "http://localhost:3000"]
-    
+
+    # Railway — set automatically by Railway at deploy time, or set manually
+    RAILWAY_PUBLIC_DOMAIN: str = ""      # e.g. asea-frontend.up.railway.app
+    RAILWAY_STATIC_URL: str = ""         # alternative Railway URL env var
+
+    @property
+    def all_cors_origins(self) -> List[str]:
+        """Merge static CORS_ORIGINS with any Railway public URLs."""
+        origins = list(self.CORS_ORIGINS)
+
+        # Add Railway domains when deployed
+        for domain in [self.RAILWAY_PUBLIC_DOMAIN, self.RAILWAY_STATIC_URL]:
+            if domain:
+                url = f"https://{domain}" if not domain.startswith("http") else domain
+                if url not in origins:
+                    origins.append(url)
+
+        # Add FRONTEND_URL if it's not localhost
+        if self.FRONTEND_URL and "localhost" not in self.FRONTEND_URL:
+            if self.FRONTEND_URL not in origins:
+                origins.append(self.FRONTEND_URL)
+
+        return origins
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 settings = Settings()

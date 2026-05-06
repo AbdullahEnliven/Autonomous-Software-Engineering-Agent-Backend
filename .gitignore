@@ -1,18 +1,45 @@
-# Python-generated files
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[oc]
+*.pyd
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
 
-# Virtual environments
-.venv
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Environment / Secrets ─────────────────────────────────────────────────────
 .env
-.env.development.local
-# Logs
-logs
+.env.*
+!.env.example.deployment
+
+# ── User project files (generated at runtime, never commit) ──────────────────
+user_projects/
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+logs/
 *.log
-# Editor directories and files
+
+# ── Pytest / Testing ──────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Editor ────────────────────────────────────────────────────────────────────
 .vscode/*
 !.vscode/extensions.json
+.idea/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Alembic ───────────────────────────────────────────────────────────────────
+# Keep migrations but not temp files
+migrations/__pycache__/

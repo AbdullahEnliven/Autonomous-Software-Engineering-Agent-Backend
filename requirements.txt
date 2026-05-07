@@ -17,6 +17,7 @@ anyio==4.12.1
     #   starlette
     #   watchfiles
 asyncpg==0.31.0
+psycopg2-binary==2.9.10
     # via backend (pyproject.toml)
 bcrypt==5.0.0
     # via backend (pyproject.toml)

@@ -62,25 +62,32 @@ class Settings(BaseSettings):
     # Monitoring
     SENTRY_DSN: str = ""
     FRONTEND_URL: str = "http://localhost:5173"
-    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:8000", "http://localhost:3000"]
+
+    # Stored as str so pydantic-settings never tries to JSON-parse it automatically.
+    # The validator below converts it to List[str].
+    CORS_ORIGINS: str = "http://localhost:5173,http://localhost:8000,http://localhost:3000"
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def parse_cors_origins(cls, v):
-        """Handle CORS_ORIGINS as JSON array, comma-separated string, or plain URL."""
         if isinstance(v, list):
-            return v
-        if isinstance(v, str):
-            v = v.strip()
-            if v.startswith("["):
-                try:
-                    parsed = json.loads(v)
-                    if isinstance(parsed, list):
-                        return [str(item).strip() for item in parsed]
-                except json.JSONDecodeError:
-                    pass
-            return [origin.strip() for origin in v.split(",") if origin.strip()]
-        return v
+            return ",".join(v)
+        return str(v) if v else ""
+
+    @property
+    def cors_origins_list(self) -> List[str]:
+        """Returns CORS_ORIGINS as a parsed list."""
+        v = self.CORS_ORIGINS.strip()
+        if not v:
+            return []
+        if v.startswith("["):
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    return [str(i).strip() for i in parsed]
+            except json.JSONDecodeError:
+                pass
+        return [o.strip() for o in v.split(",") if o.strip()]
 
     # Railway
     RAILWAY_PUBLIC_DOMAIN: str = ""
@@ -88,8 +95,8 @@ class Settings(BaseSettings):
 
     @property
     def all_cors_origins(self) -> List[str]:
-        """Merge static CORS_ORIGINS with any Railway public URLs."""
-        origins = list(self.CORS_ORIGINS)
+        """Merge CORS_ORIGINS with any Railway public URLs."""
+        origins = self.cors_origins_list
 
         for domain in [self.RAILWAY_PUBLIC_DOMAIN, self.RAILWAY_STATIC_URL]:
             if domain:

@@ -21,7 +21,7 @@ class SpecificationAgent(BaseAgent):
         # We use a model that handles JSON reliably.
         self.gemini_model = None
         if settings.GEMINI_API_KEY:
-            self.gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+            self.gemini_model = genai.GenerativeModel("gemini-2.5-flash-lite")
     
     async def generate_specification(self, requirement: Requirement) -> Dict[str, Any]:
         self.log(f"Generating specification for requirement {requirement.id}")

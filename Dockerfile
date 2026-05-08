@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-# Install system deps (for asyncpg, cryptography, Node for Vercel CLI)
+# Install system deps
 RUN apt-get update && apt-get install -y \
     curl \
     git \
@@ -22,12 +22,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy rest of the app
 COPY . .
 
+# Make startup script executable
+RUN chmod +x /app/start.sh
+
 # Expose port (Railway injects $PORT)
 EXPOSE 8000
 
-# Run migrations then start the server
-CMD alembic upgrade head && \
-    uvicorn app.main:app \
-    --host 0.0.0.0 \
-    --port ${PORT:-8000} \
-    --workers 2
+# Use startup script (handles migrations + server)
+CMD ["/app/start.sh"]

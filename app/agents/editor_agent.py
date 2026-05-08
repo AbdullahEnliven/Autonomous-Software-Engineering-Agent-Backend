@@ -46,7 +46,7 @@ class EditorAgent(BaseAgent):
         # --- Gemini (fallback) ---
         self.gemini_model = None
         if settings.GEMINI_API_KEY:
-            self.gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+            self.gemini_model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
         # Socket.IO references for real-time status
         self.sio = None
